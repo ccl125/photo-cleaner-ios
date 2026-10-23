@@ -1,0 +1,6 @@
+PhotoCleaner.xcodeproj/
+DerivedData/
+.DS_Store
+xcuserdata/
+
+*.log

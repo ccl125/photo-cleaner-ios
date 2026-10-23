@@ -1,0 +1,89 @@
+name: PhotoCleaner
+options:
+  bundleIdPrefix: com.ccl125
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+targets:
+  PhotoCleaner:
+    type: application
+    platform: iOS
+    sources:
+      - path: PhotoCleaner
+        excludes:
+          - "Info.plist"
+    info:
+      path: PhotoCleaner/Info.plist
+      properties:
+        CFBundleDisplayName: PhotoCleaner
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: ""
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSPhotoLibraryUsageDescription: 需要访问您的照片库，用于在设备本地检测相似与重复照片。全部分析仅在设备上完成，照片不会上传。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ccl125.PhotoCleaner
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "HLR6G9L687"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    postBuildScripts:
+      - name: "Copy Core ML models into bundle (Debug only)"
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "$CONFIGURATION" = "Debug" ]; then
+            SRC="/Users/cuichenglong/mayday/photo-cleaner-prototype/models/embeddinggemma-2-coreml"
+            DST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Models"
+            mkdir -p "$DST"
+            rm -rf "$DST/EmbeddingGemma2Vision.mlpackage" "$DST/EmbeddingGemma2Text.mlpackage"
+            rsync -a "$SRC/EmbeddingGemma2Vision.mlpackage" "$DST/"
+            rsync -a "$SRC/EmbeddingGemma2Text.mlpackage" "$DST/"
+            echo "Copied Core ML model packages to app bundle (Debug)."
+          else
+            echo "Non-Debug configuration: models are NOT bundled."
+          fi
+
+  PhotoCleanerUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: PhotoCleanerUITests
+    dependencies:
+      - target: PhotoCleaner
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "HLR6G9L687"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: PhotoCleaner
+
+schemes:
+  PhotoCleaner:
+    build:
+      targets:
+        PhotoCleaner: all
+        PhotoCleanerUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PhotoCleanerUITests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
