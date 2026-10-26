@@ -11,7 +11,7 @@ enum AutoTest {
 
     static func log(_ s: String) {
         print(s)
-        guard enabled else { return }
+        // 始终写文件，便于真机问题诊断（不仅仅是自测模式）
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
         if let h = try? FileHandle(forWritingTo: logURL) {
             h.seekToEndOfFile()

@@ -5,6 +5,7 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject private var scanner: LibraryScanner
     @State private var cleanup: CleanupScanner.Summary?
+    @AppStorage("fpThresholdV2") private var fpThresholdV2: Double = 0.15
 
     var body: some View {
         VStack(spacing: 24) {
@@ -22,12 +23,16 @@ struct HomeView: View {
             statsSection
             cleanupSection
             scanSection
+            labSection
 
             Spacer()
         }
         .padding()
         .navigationBarHidden(true)
-        .onAppear { scanner.refreshAuth() }
+        .onAppear {
+            scanner.refreshAuth()
+            scanner.refreshCounts()
+        }
         .task(id: scanner.authStatus) { await loadCleanupSummary() }
     }
 
@@ -130,6 +135,8 @@ struct HomeView: View {
                 .buttonStyle(.bordered)
                 .disabled(scanner.authStatus != .authorized && scanner.authStatus != .limited)
                 .accessibilityIdentifier("testScanButton")
+            // 已有索引就随时可进分析页，不必先扫描
+            if scanner.indexedCount >= 2 { analyzeButton }
         case .preparingModels:
             Label("正在加载模型（首次需编译，约 1 分钟）…", systemImage: "cpu")
             ProgressView()
@@ -158,6 +165,25 @@ struct HomeView: View {
             Button("重试") { scanner.start() }
                 .buttonStyle(.bordered)
         }
+    }
+
+    // MARK: - 实验室（阈值调节）
+
+    private var labSection: some View {
+        VStack(spacing: 6) {
+            HStack {
+                Text("重复判定严格度").foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.2f", fpThresholdV2)).monospacedDigit()
+            }
+            .font(.subheadline)
+            Slider(value: $fpThresholdV2, in: 0.05...0.60, step: 0.05)
+            Text("越小越严格：只有像素级几乎一样的照片才会进入删除建议")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var analyzeButton: some View {

@@ -1,15 +1,17 @@
 import Accelerate
 import Foundation
 
-/// 全量向量两两 cosine（向量已 L2 归一化，点积即 cosine），union-find 连通分组。
-/// 双阈值分档，同一次得分计算里顺带完成：
-///   - 重复组 duplicate：> 0.93（近重复，可直接清理）
-///   - 相似组 similar：0.80–0.93（同主题/连拍，人工优选）
-/// 同一对只归到最高命中的档（两条边集互斥，各自做连通分组）。
+/// 全量向量两两 cosine（向量已 L2 归一化，点积即 cosine），锚点星型聚类。
 ///
-/// 性能：分块 cblas_sgemm（每次 256 行查询向量 x 全库矩阵，Accelerate 多核并行），
-/// 比逐行 sgemv 快一个数量级；得分块内存固定 256 x n（1 万张约 10MB）。
-/// 遍历时只算上三角（j > i）。进度经 progress 回调逐块上报（后台线程触发）。
+/// 为什么不用 union-find：链式传递（A~B, B~C, C~D…）会把几千张互不相似的照片
+/// 串成一组（真机实测 4,594 张里最大组 3,357 张）。星型聚类只允许直接与锚点
+/// 相似的照片入组，组内凝聚度有保证（实测 min ≥ 0.86）。
+///
+/// 双阈值分档：
+///   - 重复组 duplicate：> 0.97（近重复，可安全建议删除）
+///   - 相似组 similar：0.90–0.97（同主题/连拍，只浏览不自动建议删除）
+///   已进入重复组的照片不再参与相似组。
+/// 内存 O(n)：分块 sgemm 只统计度数，锚点行用 sgemv 按需重算。
 enum DedupAnalyzer {
 
     enum Tier: Sendable {
@@ -22,8 +24,8 @@ enum DedupAnalyzer {
         var assetIDs: [String]
     }
 
-    static let duplicateThreshold: Float = EmbeddingEngine.similarityThreshold // 0.93，勿动
-    static let similarThreshold: Float = 0.80
+    static let duplicateThreshold: Float = 0.97
+    static let similarThreshold: Float = 0.90
     private static let blockRows = 256
 
     static func findGroups(store: EmbeddingStore,
@@ -34,14 +36,15 @@ enum DedupAnalyzer {
         let dim = EmbeddingEngine.outputDim
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        AutoTest.log("[Analyze] findGroups 开始: n=\(n), dim=\(dim), 块大小=\(blockRows)")
+        AutoTest.log("[Analyze] findGroups 开始: n=\(n), dim=\(dim)")
 
         var flat = [Float]()
         flat.reserveCapacity(n * dim)
         for (_, v) in all { flat.append(contentsOf: v) }
 
-        var ufDup = UnionFind(n)
-        var ufSim = UnionFind(n)
+        // ---- Pass 1：分块 sgemm，只统计每个向量在两档上的度数
+        var degDup = [Int](repeating: 0, count: n)
+        var degSim = [Int](repeating: 0, count: n)
         var scoreBlock = [Float](repeating: 0, count: blockRows * n)
 
         flat.withUnsafeBufferPointer { mat in
@@ -49,7 +52,6 @@ enum DedupAnalyzer {
             var row0 = 0
             while row0 < n {
                 let rows = min(blockRows, n - row0)
-                // C[rows x n] = A[rows x dim] · Bᵀ，其中 B = 全库矩阵[n x dim]（行主序，转置乘）
                 scoreBlock.withUnsafeMutableBufferPointer { c in
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                                 Int32(rows), Int32(n), Int32(dim),
@@ -57,66 +59,84 @@ enum DedupAnalyzer {
                                 base, Int32(dim),
                                 0.0, c.baseAddress!, Int32(n))
                 }
-                // 块内阈值扫描：只算上三角 j > i（i = row0 + r 为全局行号）
                 scoreBlock.withUnsafeBufferPointer { s in
                     guard let sb = s.baseAddress else { return }
                     for r in 0..<rows {
                         let i = row0 + r
-                        var j = i + 1
                         let rowPtr = sb + r * n
+                        var dd = 0, ds = 0
+                        var j = i + 1
+                        // 单次遍历同时累计两侧度数（矩阵对称，只看上三角）
                         while j < n {
                             let score = rowPtr[j]
-                            if score > duplicateThreshold {
-                                ufDup.union(i, j)            // 最高档，只进 duplicate
-                            } else if score > similarThreshold {
-                                ufSim.union(i, j)            // 次档，只进 similar
-                            }
+                            if score > duplicateThreshold { dd += 1; degDup[j] += 1 }
+                            else if score > similarThreshold { ds += 1; degSim[j] += 1 }
                             j += 1
                         }
+                        degDup[i] += dd
+                        degSim[i] += ds
                     }
                 }
                 row0 += rows
-                let p = Double(row0) / Double(n)
+                let p = Double(row0) / Double(n) * 0.7   // pass1 占 70% 进度
                 AutoTest.log("[Analyze] 分组进度 \(Int((p * 100).rounded()))%")
                 progress?(p)
             }
         }
 
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        AutoTest.log("[Analyze] findGroups 完成: n=\(n), 耗时 \(String(format: "%.1f", elapsed))s")
-
-        let dupGroups = components(of: ufDup, n: n, ids: all.map(\.id))
-            .map { Group(tier: .duplicate, assetIDs: $0) }
-            .sorted { $0.assetIDs.count > $1.assetIDs.count }
-        let simGroups = components(of: ufSim, n: n, ids: all.map(\.id))
-            .map { Group(tier: .similar, assetIDs: $0) }
-            .sorted { $0.assetIDs.count > $1.assetIDs.count }
-        return dupGroups + simGroups
-    }
-
-    /// size >= 2 的连通分量 -> assetID 数组（按向量插入顺序）。
-    private static func components(of uf: UnionFind, n: Int, ids: [String]) -> [[String]] {
-        var uf = uf
-        var byRoot: [Int: [String]] = [:]
-        for i in 0..<n {
-            byRoot[uf.find(i), default: []].append(ids[i])
+        // ---- Pass 2：按度数降序选锚点，sgemv 重算锚点行，星型聚类
+        // 重复组优先；重复组成员不再参与相似组。
+        func starGroups(lo: Float, hi: Float, degrees: [Int],
+                        excluded: inout [Bool], label: String) -> [[Int]] {
+            var order = Array(0..<n).filter { degrees[$0] > 0 && !excluded[$0] }
+            order.sort { degrees[$0] > degrees[$1] }
+            var groups: [[Int]] = []
+            var row = [Float](repeating: 0, count: n)
+            var done = 0
+            for a in order {
+                if excluded[a] { continue }
+                // 重算锚点与全库的相似度行
+                flat.withUnsafeBufferPointer { mat in
+                    guard let base = mat.baseAddress else { return }
+                    row.withUnsafeMutableBufferPointer { r in
+                        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                                    Int32(n), Int32(dim), 1.0,
+                                    base, Int32(dim),
+                                    base + a * dim, 1, 0.0, r.baseAddress!, 1)
+                    }
+                }
+                var members: [Int] = []
+                for j in 0..<n where j != a && !excluded[j] {
+                    let s = row[j]
+                    if s > lo && s <= hi { members.append(j) }
+                }
+                guard !members.isEmpty else { continue }
+                groups.append([a] + members)
+                excluded[a] = true
+                for j in members { excluded[j] = true }
+                done += 1
+                if done % 20 == 0 {
+                    AutoTest.log("[Analyze] \(label) 聚类进行中，已 \(done) 组")
+                }
+            }
+            return groups
         }
-        return byRoot.values.filter { $0.count >= 2 }
-    }
-}
 
-private struct UnionFind {
-    private var parent: [Int]
+        var excluded = [Bool](repeating: false, count: n)
+        let dupGroups = starGroups(lo: duplicateThreshold, hi: Float.greatestFiniteMagnitude,
+                                   degrees: degDup, excluded: &excluded, label: "重复档")
+        progress?(0.85)
+        let simGroups = starGroups(lo: similarThreshold, hi: duplicateThreshold,
+                                   degrees: degSim, excluded: &excluded, label: "相似档")
 
-    init(_ n: Int) { parent = Array(0..<n) }
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        AutoTest.log("[Analyze] findGroups 完成: n=\(n), 重复组 \(dupGroups.count), 相似组 \(simGroups.count), 耗时 \(String(format: "%.1f", elapsed))s")
+        progress?(1.0)
 
-    mutating func find(_ x: Int) -> Int {
-        if parent[x] != x { parent[x] = find(parent[x]) }
-        return parent[x]
-    }
-
-    mutating func union(_ a: Int, _ b: Int) {
-        let ra = find(a), rb = find(b)
-        if ra != rb { parent[rb] = ra }
+        let ids = all.map(\.id)
+        return dupGroups.map { Group(tier: .duplicate, assetIDs: $0.map { ids[$0] }) }
+            .sorted { $0.assetIDs.count > $1.assetIDs.count }
+            + simGroups.map { Group(tier: .similar, assetIDs: $0.map { ids[$0] }) }
+            .sorted { $0.assetIDs.count > $1.assetIDs.count }
     }
 }

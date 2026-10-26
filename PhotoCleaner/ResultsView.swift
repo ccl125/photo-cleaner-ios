@@ -2,7 +2,7 @@ import Photos
 import SwiftUI
 import UIKit
 
-/// 结果页：分段展示"重复照片"(>0.93) 与"相似照片"(0.80–0.93)。
+/// 结果页：分段展示"重复照片"(>0.97) 与"相似照片"(0.90–0.97)。
 /// 每组自动质量打分并推荐保留项：
 ///   - 重复组：默认保留推荐项、其余勾选删除（红色标记）
 ///   - 相似组：只打"推荐"徽标，默认全部保留（橙色弱强调），由用户手动挑选
@@ -182,7 +182,11 @@ struct ResultsView: View {
     /// 自测模式（-autoTest）跳过所有打分，findGroups 出结果即渲染，压缩回归时长。
     private func analyze() async {
         analyzing = true
-        defer { analyzing = false }
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer {
+            analyzing = false
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
 
         analyzeNote = "正在计算相似分组…"
         groupProgress = 0
@@ -227,19 +231,97 @@ struct ResultsView: View {
                     continue
                 }
                 analyzeNote = "正在为第 \(dupOrdinal)/\(dupTotal) 个重复组打分…"
-                let (scores, recommended) = await scoreMembers(
-                    assets, label: "第 \(dupOrdinal)/\(dupTotal) 个重复组")
-                // 重复组：默认保留推荐项，其余勾选删除
-                let keep: Set<String> = [recommended ?? g.assetIDs.first ?? ""]
-                models.append(GroupModel(
-                    tier: .duplicate,
-                    assets: assets,
-                    keepIDs: keep,
-                    recommendedID: recommended,
-                    scores: scores,
-                    sizes: sizes,
-                    totalBytes: sizes.values.reduce(0, +)
-                ))
+                groupProgress = Double(dupOrdinal) / Double(max(dupTotal, 1))
+                let (scores, recommended, images) = await scoreMembers(
+                    assets, sizes: sizes, label: "第 \(dupOrdinal)/\(dupTotal) 个重复组")
+                let anchor = recommended ?? g.assetIDs.first ?? ""
+
+                // 第二级像素级验证：特征指纹距离过大的成员（不同姿势/手势）降级到相似组
+                let distances = await Task.detached(priority: .userInitiated) {
+                    FeaturePrintVerifier.distancesToAnchor(anchorID: anchor, images: images)
+                }.value
+                var confirmed: [PHAsset] = []
+                var demoted: [PHAsset] = []
+                for a in assets {
+                    if a.localIdentifier == anchor { confirmed.append(a); continue }
+                    // 未参与打分/验证的成员（大组截断、拉图失败）：必须降级，
+                    // 绝不能带着删除建议留在重复组
+                    guard let d = distances[a.localIdentifier], d.isFinite else {
+                        demoted.append(a)
+                        AutoTest.log("[Analyze] 组 \(dupOrdinal) 成员 \(a.localIdentifier.prefix(8)) 降级: 未验证（大组截断或拉图失败）")
+                        continue
+                    }
+                    // 三重条件全部满足才算真重复：
+                    // 1. 指纹距离达标（像素级几乎一致）
+                    // 2. 像素宽高完全相同（不同构图/裁剪的尺寸必不同）
+                    // 3. 拍摄时间相差 10 分钟内（同一拍摄现场）
+                    let sameSize = a.pixelWidth == (assets.first { $0.localIdentifier == anchor }?.pixelWidth ?? -1)
+                        && a.pixelHeight == (assets.first { $0.localIdentifier == anchor }?.pixelHeight ?? -2)
+                    let anchorDate = assets.first { $0.localIdentifier == anchor }?.creationDate
+                    let closeTime: Bool
+                    if let ad = anchorDate, let cd = a.creationDate {
+                        closeTime = abs(cd.timeIntervalSince(ad)) <= 600
+                    } else {
+                        closeTime = true   // 无时间信息时不阻断
+                    }
+                    if d <= FeaturePrintVerifier.distanceThreshold && sameSize && closeTime {
+                        confirmed.append(a)
+                    } else {
+                        demoted.append(a)
+                        AutoTest.log("[Analyze] 组 \(dupOrdinal) 成员 \(a.localIdentifier.prefix(8)) 降级: 距离=\(String(format: "%.2f", d)) 同尺寸=\(sameSize) 时间近=\(closeTime)")
+                    }
+                }
+                if distances.isEmpty {
+                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 特征指纹计算失败（锚点无指纹），跳过二级验证")
+                }
+                // 全量距离落日志，供阈值校准
+                let allDist = distances
+                    .filter { $0.key != anchor }
+                    .map { "\($0.key.prefix(8))=\(String(format: "%.2f", $0.value))" }
+                    .joined(separator: ",")
+                if !allDist.isEmpty {
+                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 指纹距离: \(allDist)")
+                }
+                if !demoted.isEmpty {
+                    let distDesc = demoted.map {
+                        "\($0.localIdentifier.prefix(8))=\(String(format: "%.1f", distances[$0.localIdentifier] ?? -1))"
+                    }.joined(separator: ",")
+                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 降级 \(demoted.count) 张到相似组: \(distDesc)")
+                }
+
+                // 重复组：默认保留推荐项，其余勾选删除；验证后不足 2 张则整组降为相似组
+                if confirmed.count < 2 {
+                    models.append(GroupModel(
+                        tier: .similar,
+                        assets: assets,
+                        keepIDs: Set(g.assetIDs),
+                        recommendedID: nil,
+                        sizes: sizes,
+                        totalBytes: assets.reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
+                    ))
+                } else {
+                    let keep: Set<String> = [anchor]
+                    models.append(GroupModel(
+                        tier: .duplicate,
+                        assets: confirmed,
+                        keepIDs: keep,
+                        recommendedID: recommended,
+                        scores: scores,
+                        sizes: sizes,
+                        totalBytes: confirmed.reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
+                    ))
+                    if !demoted.isEmpty, let first = confirmed.first {
+                        // 降级成员与锚点组成一个相似组，只浏览不建议删除
+                        models.append(GroupModel(
+                            tier: .similar,
+                            assets: [first] + demoted,
+                            keepIDs: Set(([first] + demoted).map(\.localIdentifier)),
+                            recommendedID: nil,
+                            sizes: sizes,
+                            totalBytes: ([first] + demoted).reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
+                        ))
+                    }
+                }
             case .similar:
                 // 相似组：保守，默认全保留；推荐徽标留空，由"为这组打分推荐"按钮惰性触发
                 models.append(GroupModel(
@@ -260,13 +342,15 @@ struct ResultsView: View {
     }
 
     /// 对一组成员做质量打分：单组上限 20 个（按文件体积取大），256px + opportunistic + 8s 超时。
+    /// sizes 为分析阶段后台预取的体积表，排序只查内存，不在主线程重复读 PhotoKit 元数据。
+    /// 返回打分结果与已拉取的图片（供特征指纹二级验证复用，零额外拉图成本）。
     private func scoreMembers(
-        _ assets: [PHAsset], label: String
-    ) async -> (scores: [String: QualityScorer.MemberScore], recommended: String?) {
+        _ assets: [PHAsset], sizes: [String: Int64], label: String
+    ) async -> (scores: [String: QualityScorer.MemberScore], recommended: String?, images: [String: UIImage]) {
         let scored: [PHAsset]
         if assets.count > 20 {
             scored = Array(assets
-                .sorted { CleanupScanner.fileSize(of: $0) > CleanupScanner.fileSize(of: $1) }
+                .sorted { (sizes[$0.localIdentifier] ?? 0) > (sizes[$1.localIdentifier] ?? 0) }
                 .prefix(20))
         } else {
             scored = assets
@@ -286,9 +370,10 @@ struct ResultsView: View {
                 AutoTest.log("[Analyze] 成员图拉取失败（超时/iCloud）: \(asset.localIdentifier)")
             }
         }
-        return await Task.detached(priority: .userInitiated) {
+        let result = await Task.detached(priority: .userInitiated) {
             QualityScorer.scoreGroup(assets: scored, images: images)
         }.value
+        return (result.scores, result.recommended, images)
     }
 
     /// 相似组的惰性打分入口（按钮触发）：只对该组拉图打分，更新推荐徽标，不改勾选状态。
@@ -296,7 +381,8 @@ struct ResultsView: View {
         guard !group.wrappedValue.isScoring else { return }
         group.isScoring.wrappedValue = true
         Task {
-            let (scores, recommended) = await scoreMembers(group.wrappedValue.assets, label: "相似组（手动）")
+            let (scores, recommended, _) = await scoreMembers(
+                group.wrappedValue.assets, sizes: group.wrappedValue.sizes, label: "相似组（手动）")
             group.scores.wrappedValue = scores
             group.recommendedID.wrappedValue = recommended
             group.isScoring.wrappedValue = false

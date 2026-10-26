@@ -47,6 +47,20 @@ final class LibraryScanner: ObservableObject {
         authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     }
 
+    /// 首页展示用的真实计数：相册最近 6 个月图片总数 + 向量库已索引数。
+    /// 不依赖扫描状态（避免上次小范围测试残留的 200 误导显示）。
+    func refreshCounts() {
+        guard authStatus == .authorized || authStatus == .limited else { return }
+        let opts = PHFetchOptions()
+        let since = Calendar.current.date(byAdding: .month, value: -6, to: Date())! as NSDate
+        opts.predicate = NSPredicate(format: "creationDate > %@", since)
+        totalAssets = PHAsset.fetchAssets(with: .image, options: opts).count
+        if let opened = try? store.open() {
+            _ = opened
+            indexedCount = store.count()
+        }
+    }
+
     func requestAccess() async {
         authStatus = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     }
@@ -82,6 +96,8 @@ final class LibraryScanner: ObservableObject {
     // MARK: - 主流程
 
     private func runScan(limit: Int? = nil) async {
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
         do {
             state = .preparingModels
             try await engine.prepare()
