@@ -33,6 +33,10 @@ final class LibraryScanner: ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var pauseRequested = false
     private var pendingTotal = 0
+    private var ocrTotalMs: Double = 0
+    private var ocrCount = 0
+    private var qualityTotalMs: Double = 0
+    private var qualityCount = 0
 
     var isBusy: Bool { state == .running || state == .preparingModels }
 
@@ -110,13 +114,27 @@ final class LibraryScanner: ObservableObject {
 
         let assets = Self.fetchRecentAssets(months: 6)
         let done = store.existingIDs()
-        var pending = assets.filter { !done.contains($0.localIdentifier) }
+        let ocrDone = store.existingOcrIDs()
+        let qualityDone = store.existingQualityIDs()
+        // 断点续跑 + 补建：有向量无 OCR/质量信号的条目只补缺的，不重算向量
+        var pending = assets.filter {
+            !done.contains($0.localIdentifier) || !ocrDone.contains($0.localIdentifier)
+                || !qualityDone.contains($0.localIdentifier)
+        }
         if let limit { pending = Array(pending.prefix(limit)) }
         totalAssets = limit != nil ? pending.count : assets.count
         pendingTotal = pending.count
         indexedCount = done.count
         processedThisRun = 0
         failedThisRun = 0
+        ocrTotalMs = 0
+        ocrCount = 0
+        qualityTotalMs = 0
+        qualityCount = 0
+        let backfillOnly = pending.filter { done.contains($0.localIdentifier) }.count
+        if backfillOnly > 0 {
+            AutoTest.log("[Scanner] 补建: \(backfillOnly) 条已有向量待补 OCR/质量信号")
+        }
 
         guard !pending.isEmpty else {
             state = .finished
@@ -131,17 +149,50 @@ final class LibraryScanner: ObservableObject {
                 return
             }
             do {
+                let id = asset.localIdentifier
+                let needsEmbed = !done.contains(id)
+                let needsOcr = !ocrDone.contains(id)
+                let needsQuality = !qualityDone.contains(id)
+                guard needsEmbed || needsOcr || needsQuality else { continue }
+
                 guard let image = await Self.requestImage(for: asset) else {
                     failedThisRun += 1
-                    AutoTest.log("[Scanner] 图片拉取失败: \(asset.localIdentifier)")
+                    AutoTest.log("[Scanner] 图片拉取失败: \(id)")
                     continue
                 }
-                let (vector, _) = try await engine.embed(image)
-                store.insert(id: asset.localIdentifier, vector: vector)
+                if needsEmbed {
+                    let (vector, _) = try await engine.embed(image)
+                    store.insert(id: id, vector: vector)
+                    indexedCount += 1
+                }
+                if needsOcr {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let text = await Task.detached(priority: .utility) {
+                        OcrEngine.recognizeText(image)
+                    }.value
+                    let ocrMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                    store.insertOcr(id: id, text: text)
+                    ocrTotalMs += ocrMs
+                    ocrCount += 1
+                    AutoTest.log("[Scanner] ocr \(String(format: "%.0f", ocrMs))ms（\(text.isEmpty ? "无文字" : "\(text.count) 字符")）")
+                }
+                if needsQuality {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let record = await Task.detached(priority: .utility) {
+                        JunkScorer.computeSignals(image)
+                    }.value
+                    let qMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                    store.insertQuality(id: id, record: record)
+                    qualityTotalMs += qMs
+                    qualityCount += 1
+                    let (js, reasons) = JunkScorer.score(record)
+                    AutoTest.log("[Scanner] quality \(String(format: "%.0f", qMs))ms junk=\(String(format: "%.2f", js))\(reasons.isEmpty ? "" : " " + reasons.joined(separator: "/"))")
+                }
                 processedThisRun += 1
-                indexedCount += 1
                 if processedThisRun % 10 == 0 {
-                    AutoTest.log("[Scanner] 已处理 \(processedThisRun)，平均 \(String(format: "%.0f", await engine.stats.avgMs))ms/张")
+                    let ocrAvg = ocrCount > 0 ? ocrTotalMs / Double(ocrCount) : 0
+                    let qAvg = qualityCount > 0 ? qualityTotalMs / Double(qualityCount) : 0
+                    AutoTest.log("[Scanner] 已处理 \(processedThisRun)，embedding 平均 \(String(format: "%.0f", await engine.stats.avgMs))ms/张，ocr 平均 \(String(format: "%.0f", ocrAvg))ms/张，quality 平均 \(String(format: "%.0f", qAvg))ms/张")
                 }
             } catch {
                 failedThisRun += 1

@@ -6,6 +6,9 @@ struct HomeView: View {
     @EnvironmentObject private var scanner: LibraryScanner
     @State private var cleanup: CleanupScanner.Summary?
     @AppStorage("fpThresholdV2") private var fpThresholdV2: Double = 0.15
+    @AppStorage("junkThreshold") private var junkThreshold: Double = 0.6
+    @State private var searchText = ""
+    @State private var junkCount: Int?
 
     var body: some View {
         VStack(spacing: 24) {
@@ -19,13 +22,23 @@ struct HomeView: View {
                     .accessibilityIdentifier("autoTestStatus")
             }
 
-            authSection
-            statsSection
-            cleanupSection
-            scanSection
-            labSection
+            TextField("语义搜图：试试「猫」「风景」「文档」…", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .accessibilityIdentifier("searchField")
 
-            Spacer()
+            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                authSection
+                statsSection
+                cleanupSection
+                junkSection
+                scanSection
+                labSection
+
+                Spacer()
+            } else {
+                SearchResultsGrid(query: searchText)
+            }
         }
         .padding()
         .navigationBarHidden(true)
@@ -34,6 +47,17 @@ struct HomeView: View {
             scanner.refreshCounts()
         }
         .task(id: scanner.authStatus) { await loadCleanupSummary() }
+        .task(id: junkThreshold) { await loadJunkCount() }
+        .task(id: scanner.indexedCount) { await loadJunkCount() }
+    }
+
+    private func loadJunkCount() async {
+        guard scanner.authStatus == .authorized || scanner.authStatus == .limited else { return }
+        let store = scanner.store
+        let thr = junkThreshold
+        junkCount = await Task.detached(priority: .utility) {
+            JunkReviewView.loadCandidates(store: store, threshold: thr).list.count
+        }.value
     }
 
     private func loadCleanupSummary() async {
@@ -121,6 +145,25 @@ struct HomeView: View {
         }
     }
 
+    // MARK: - 废片清理
+
+    @ViewBuilder
+    private var junkSection: some View {
+        if scanner.authStatus == .authorized || scanner.authStatus == .limited {
+            NavigationLink {
+                JunkReviewView(threshold: junkThreshold)
+            } label: {
+                if let junkCount {
+                    Text("废片清理（\(junkCount) 张待审）→")
+                } else {
+                    Text("废片清理（统计中…）")
+                }
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("junkEntry")
+        }
+    }
+
     // MARK: - 扫描控制
 
     @ViewBuilder
@@ -179,6 +222,19 @@ struct HomeView: View {
             .font(.subheadline)
             Slider(value: $fpThresholdV2, in: 0.05...0.60, step: 0.05)
             Text("越小越严格：只有像素级几乎一样的照片才会进入删除建议")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            Divider().padding(.vertical, 4)
+
+            HStack {
+                Text("废片嫌疑阈值").foregroundStyle(.secondary)
+                Spacer()
+                Text(String(format: "%.2f", junkThreshold)).monospacedDigit()
+            }
+            .font(.subheadline)
+            Slider(value: $junkThreshold, in: 0.3...0.9, step: 0.05)
+            Text("越高越保守：只有废片特征很明显的照片才进入速审队列")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

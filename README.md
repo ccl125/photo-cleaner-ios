@@ -80,3 +80,26 @@ xcrun devicectl device copy from --device 00008110-000829000A51801E \
 - **质量打分 + 组内推荐保留**（`QualityScorer.swift`）：只对组内成员算分。模糊用 Laplacian 方差（256px 灰度 + vImage PlanarF 卷积，log 后组内 min-max 归一）；人脸用 `VNDetectFaceCaptureQualityRequest` 取最高值（无人脸记中性 0.5）；分辨率按组内最大像素数归一。综合分 = 0.4 模糊 + 0.3 人脸 + 0.3 分辨率。ResultsView 给推荐项打"推荐"徽标。
 - **清理清单**（`CleanupScanner.swift` + `CleanupListView.swift`）：截图（mediaSubtypes & photoScreenshot）、录屏（video + videoScreenRecording）、大视频 Top 50（PHAssetResource fileSize 降序）。网格勾选 + 全选，删除走统一的 `PhotoDeleter.delete`（与分组删除同一入口，系统确认框为预期行为）。首页统计区显示"截图 X 张 / 录屏 Y 个 / 大视频 Z GB"。
 - **双阈值分档**（`DedupAnalyzer.swift`）：同一次 sgemv 逐行扫描里判断两档，边集互斥（同一对只归最高命中档）——重复组 >0.93（默认保留推荐项、其余勾选删除），相似组 0.80–0.93（默认全保留、仅显示推荐徽标，橙色弱强调）。ResultsView 分两个 Section 展示。
+
+## v0.3 功能说明：自然语言语义搜图
+
+- **文本向量化**（`EmbeddingEngine.embedText`）：tokenizer（swift-transformers 的 Tokenizers 模块，SPM 引入；`AutoTokenizer.from(modelFolder:)` 读 bundle 里的 `tokenizer.json` + 自制最小 `tokenizer_config.json`）→ token id（post-processor 自动拼 `<bos>/<eos>`）→ int8 量化词表反量化出 512 维向量（已预乘 √512）→ 文本塔 embed_128 → 768 维 → 截 256 + L2 归一化。query 自动加检索前缀 `task: search result | query: `，超长按 128 token 截断。
+- **词表瘦身**：`embeddings.bf16`（256MB bf16）→ 逐行 absmax int8 量化 → `ModelAssets/vocab_embeddings_i8.bin`（135MB，单行相对误差 ~1%），Debug Run Script 注入 bundle（不进 Resources，Release 不携带）。重新生成：`cd ../photo-cleaner-prototype && .venv/bin/python export_ios_text_assets.py`。
+- **检索**（`SemanticSearch.swift`）：`VectorIndex` 内存缓存全库向量（条数变化自动重建），cblas_sgemv 一次算全库分数，Top 50。
+- **UI**：首页自定义 TextField（`searchField`），非空时切换为结果网格（缩略图 + 分数角标），点击全屏查看。
+- **自测**：`-autoTest` 模式扫描结束后自动跑「猫」「风景」「文档」三个 query，Top 5 写 autotest.log，格式：`[AutoTest] query="猫" top5=<localIdentifier>#0.xxx,...`。
+
+## v0.3a 功能说明：OCR 混合检索 + 模型生命周期
+
+- **OCR 索引**（`OcrEngine.swift` + EmbeddingStore 新 `ocr` 表）：扫描流程里每张图算完向量后顺手跑 `VNRecognizeTextRequest`（fast 档，zh-Hans + en-US，按行空格连接存库；空文本也写库作为"已跑过"标记）。断点续跑按"有向量无 OCR"自动补建，不重算向量。每张单独计时打 `[Scanner] ocr xMms`。
+- **混合检索**（`SemanticSearch.VectorIndex.hybridTopK`）：语义 cosine 分 + OCR 子串命中加分（普通 query +0.15；含数字或单号/URL 格式的精确串 +0.30），命中条目在结果网格标"文字"蓝色徽标。索引缓存同时含小写 OCR 文本。
+- **模型闲置释放**：EmbeddingEngine 每次推理刷新 60s 计时，超时卸载双塔 + tokenizer + 词表（约 600MB），下次调用 prepare() 懒加载，日志 `[Engine] 闲置 60s 无推理，模型已卸载`。
+- **索引版本**：meta 表记 `modelVersion = eg2-256d-v1`，不匹配仅日志提示，不强制清库。
+- **自测**：`-autoTest` 增加 `[AutoTest] ocr覆盖=x/y（有文本 z 条）`，固定 query 追加精确串 "http"，命中项带 `[文]` 标记。
+
+## v0.3c 功能说明：废片候选队列
+
+- **信号与打分**（`JunkScorer.swift`）：模糊（复用 QualityScorer 的 Laplacian 方差，log 域归一：方差 <5 全模糊、>500 清晰）+ 黑帧/过曝（128px 灰度亮度均值越界且方差小）+ 闭眼人像（人脸质量低分；无人脸记中性 0）。junkScore = 0.5·模糊 + 0.3·黑白帧 + 0.2·闭眼，阈值走首页实验室滑块（默认 0.6）。
+- **扫描流水线**：embedding → OCR → 质量信号，同一张 512px 图三次利用；`quality` 表存原始信号（不算分数，分数查询时现算，阈值可调不重扫）。补建与 OCR 同机制。
+- **UI**（`JunkReviewView.swift`）：首页"废片清理（N 张待审）"入口；卡片速审（左滑/删除、右滑/保留，按钮 + 手势双通道），原因标签 + 废片分，进度 x/N；审完统一删除（PhotoDeleter + `store.deleteEverywhere` 三清 embeddings/ocr/quality）。候选排除截图（走清理清单）。
+- **测试**：`PhotoCleanerTests/JunkScorerTests.swift` 4 个纯逻辑用例（模糊排序、黑白帧边界、人脸中性、综合分阈值）。

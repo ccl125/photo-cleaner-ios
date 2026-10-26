@@ -5,6 +5,11 @@ options:
     iOS: "18.0"
   createIntermediateGroups: true
 
+packages:
+  Transformers:
+    url: https://github.com/huggingface/swift-transformers
+    from: "0.1.0"
+
 targets:
   PhotoCleaner:
     type: application
@@ -13,6 +18,12 @@ targets:
       - path: PhotoCleaner
         excludes:
           - "Info.plist"
+          - "Resources/Tokenizer/**"
+      - path: PhotoCleaner/Resources/Tokenizer
+        type: folder
+    dependencies:
+      - package: Transformers
+        product: Transformers
     info:
       path: PhotoCleaner/Info.plist
       properties:
@@ -48,10 +59,27 @@ targets:
             rm -rf "$DST/EmbeddingGemma2Vision.mlpackage" "$DST/EmbeddingGemma2Text.mlpackage"
             rsync -a "$SRC/EmbeddingGemma2Vision.mlpackage" "$DST/"
             rsync -a "$SRC/EmbeddingGemma2Text.mlpackage" "$DST/"
-            echo "Copied Core ML model packages to app bundle (Debug)."
+            rsync -a "${SRCROOT}/ModelAssets/vocab_embeddings_i8.bin" "$DST/"
+            echo "Copied Core ML model packages + vocab table to app bundle (Debug)."
           else
             echo "Non-Debug configuration: models are NOT bundled."
           fi
+
+  PhotoCleanerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PhotoCleanerTests
+    dependencies:
+      - target: PhotoCleaner
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "HLR6G9L687"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: PhotoCleaner
 
   PhotoCleanerUITests:
     type: bundle.ui-testing
@@ -75,12 +103,14 @@ schemes:
       targets:
         PhotoCleaner: all
         PhotoCleanerUITests: [test]
+        PhotoCleanerTests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
         - PhotoCleanerUITests
+        - PhotoCleanerTests
     profile:
       config: Release
     analyze:

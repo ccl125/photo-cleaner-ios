@@ -68,8 +68,38 @@ struct PhotoCleanerApp: App {
             scanner.autoTestStatus += "｜索引不足，未进分析页"
             return
         }
+
+        // 语义搜图自测：3 个固定 query，Top 5 asset id + 分数写进 autotest.log
+        await runSearchSelfTest()
+
+        // 废片候选统计（默认阈值 0.6，loadCandidates 内部会打 [Junk] 分布日志）
+        let store = scanner.store
+        _ = await Task.detached(priority: .utility) {
+            JunkReviewView.loadCandidates(store: store, threshold: 0.6)
+        }.value
+
         AutoTest.log("[AutoTest] 进入分析页")
         scanner.autoTestStatus += "｜已进入分析页"
         path.append("results")
+    }
+
+    /// 语义搜图自测：固定 query 跑 Top 5，验证文本→向量→检索链路（含 OCR 关键词通道）。
+    private func runSearchSelfTest() async {
+        let idx = SemanticSearch.VectorIndex.shared
+        idx.reloadIfNeeded(store: scanner.store)
+        let cov = scanner.store.ocrCoverage()
+        AutoTest.log("[AutoTest] ocr覆盖=\(cov.total)/\(scanner.store.count())（有文本 \(cov.withText) 条）")
+        for q in ["猫", "风景", "文档", "http"] {
+            do {
+                let vec = try await scanner.engine.embedText(q)
+                let top = idx.hybridTopK(queryVector: vec, queryText: q, k: 5)
+                let desc = top.map {
+                    "\($0.id)#\(String(format: "%.3f", $0.score))\($0.keywordMatched ? "[文]" : "")"
+                }.joined(separator: ",")
+                AutoTest.log("[AutoTest] query=\"\(q)\" top5=\(desc)")
+            } catch {
+                AutoTest.log("[AutoTest] query=\"\(q)\" 失败: \(error.localizedDescription)")
+            }
+        }
     }
 }

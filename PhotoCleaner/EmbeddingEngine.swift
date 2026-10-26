@@ -1,6 +1,7 @@
 import Accelerate
 import CoreML
 import Foundation
+import Tokenizers
 import UIKit
 
 /// Swift port of the validated Python pipeline (bench_embedding.py):
@@ -60,12 +61,25 @@ actor EmbeddingEngine {
     /// [2, 1024, 768] Float16; value for patch (x, y) = table[0][x] + table[1][y].
     private var posTable: [Float16] = []
 
+    // 文本检索（语义搜图）资产，懒加载
+    private var tokenizer: (any Tokenizer)?
+    private var vocabTable: VocabEmbeddingTable?
+    /// 检索前缀（config.json prompts.search_query；图像侧不加前缀，query 侧加）
+    static let queryPrefix = "task: search result | query: "
+
     private(set) var stats = Stats()
+
+    /// 闲置释放：60 秒无推理调用则卸载两座塔 + 文本资产（约 600MB），下次调用懒加载。
+    private var idleReleaseTask: Task<Void, Never>?
+    private static let idleTimeoutNs: UInt64 = 60_000_000_000
 
     // MARK: - Loading
 
     func prepare() throws {
-        guard vision == nil else { return }
+        if vision != nil, text != nil {
+            touchModels()
+            return
+        }
         AutoTest.log("[Engine] 加载 vision 塔 …")
         vision = try ModelManager.loadModel(package: "EmbeddingGemma2Vision", function: "vision_70")
         AutoTest.log("[Engine] 加载 text 塔 …")
@@ -73,6 +87,27 @@ actor EmbeddingEngine {
         specialTokens = try Self.loadF16(resource: "special_tokens", count: 4 * 512)
         posTable = try Self.loadF16(resource: "position_embeddings", count: 2 * 1024 * 768)
         AutoTest.log("[Engine] 模型就绪")
+        touchModels()
+    }
+
+    /// 每次推理后刷新闲置计时；超时卸载模型。
+    private func touchModels() {
+        idleReleaseTask?.cancel()
+        idleReleaseTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.idleTimeoutNs)
+            guard !Task.isCancelled else { return }
+            await self?.unloadModels()
+        }
+    }
+
+    private func unloadModels() {
+        guard vision != nil || text != nil else { return }
+        vision = nil
+        text = nil
+        tokenizer = nil
+        vocabTable = nil
+        idleReleaseTask = nil
+        AutoTest.log("[Engine] 闲置 60s 无推理，模型已卸载（下次调用自动重载）")
     }
 
     private static func loadF16(resource: String, count: Int) throws -> [Float16] {
@@ -90,6 +125,7 @@ actor EmbeddingEngine {
 
     /// Returns a 256-d L2-normalized embedding for the image.
     func embed(_ image: UIImage) throws -> (vector: [Float], timing: Timing) {
+        try prepare()  // 闲置释放后的懒加载入口
         guard let vision, let text else { throw EngineError.notPrepared }
 
         let (rgb, w, h) = try preprocess(image) // Float [0,1], w/h multiples of 48
@@ -310,5 +346,113 @@ actor EmbeddingEngine {
         }
         let m = mask.dataPointer.bindMemory(to: Float16.self, capacity: textSeq)
         for i in 0..<textSeq { m[i] = i < nTok + 4 ? 1 : 0 }
+    }
+}
+
+// MARK: - 文本检索（语义搜图）
+
+/// 词表 embedding 的 int8 量化表（Models/vocab_embeddings_i8.bin，135MB，mmap 读取）。
+/// 布局: "EGV1" | rows u32 | dim u32 | scales[rows] fp32 | data[rows×dim] int8。
+/// 导出时已预乘 √512，反量化值可直接进文本塔；bos/eos 等所有 token 行走同一张表。
+final class VocabEmbeddingTable: @unchecked Sendable {
+    let rows: Int
+    let dim: Int
+    private let data: Data
+    private let scalesOffset = 12
+    private let dataOffset: Int
+
+    init(url: URL) throws {
+        let d = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard d.count > 12, d.prefix(4).elementsEqual([0x45, 0x47, 0x56, 0x31]) else { // "EGV1"
+            throw EmbeddingEngine.EngineError.outputMissing("vocab_embeddings_i8.bin 格式错误")
+        }
+        rows = d.withUnsafeBytes { Int($0.load(fromByteOffset: 4, as: UInt32.self)) }
+        dim = d.withUnsafeBytes { Int($0.load(fromByteOffset: 8, as: UInt32.self)) }
+        dataOffset = scalesOffset + rows * MemoryLayout<Float>.size
+        guard d.count == dataOffset + rows * dim else {
+            throw EmbeddingEngine.EngineError.outputMissing("vocab_embeddings_i8.bin 大小不符")
+        }
+        data = d
+    }
+
+    /// 反量化第 id 行 → [Float]（dim 维，已含 √512 缩放）
+    func row(_ id: Int) -> [Float] {
+        precondition(id >= 0 && id < rows)
+        var out = [Float](repeating: 0, count: dim)
+        data.withUnsafeBytes { raw in
+            let scale = raw.load(fromByteOffset: scalesOffset + id * MemoryLayout<Float>.size, as: Float.self)
+            let q = raw.bindMemory(to: Int8.self)
+            let base = dataOffset + id * dim
+            for i in 0..<dim { out[i] = Float(q[base + i]) * scale }
+        }
+        return out
+    }
+}
+
+extension EmbeddingEngine {
+
+    /// 文本 → 256 维 embedding（与图像同向量空间）。自动加检索前缀，超长按 128 token 截断。
+    func embedText(_ query: String) async throws -> [Float] {
+        try prepare()  // 闲置释放后的懒加载入口（同时刷新闲置计时）
+        guard let text else { throw EngineError.notPrepared }
+        if tokenizer == nil || vocabTable == nil { try await loadTextAssets() }
+        guard let tokenizer, let vocab = vocabTable else {
+            throw EngineError.outputMissing("文本检索资产")
+        }
+
+        // tokenizer.json 的 post-processor 会自动拼 <bos>/<eos>
+        var ids = tokenizer.encode(text: Self.queryPrefix + query)
+        if ids.count > textSeq { ids = Array(ids.prefix(textSeq)) }
+
+        let seq = try MLMultiArray(shape: [1, textSeq, 512] as [NSNumber], dataType: .float16)
+        let mask = try MLMultiArray(shape: [1, textSeq] as [NSNumber], dataType: .float16)
+        let s = seq.dataPointer.bindMemory(to: Float16.self, capacity: textSeq * 512)
+        memset(s, 0, textSeq * 512 * MemoryLayout<Float16>.size)
+        for (i, id) in ids.enumerated() {
+            let row = vocab.row(id)
+            for d in 0..<512 { s[i * 512 + d] = Float16(row[d]) }
+        }
+        let m = mask.dataPointer.bindMemory(to: Float16.self, capacity: textSeq)
+        for i in 0..<textSeq { m[i] = i < ids.count ? 1 : 0 }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let out = try await text.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "inputs_embeds": MLFeatureValue(multiArray: seq),
+            "attention_mask": MLFeatureValue(multiArray: mask),
+        ]))
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+        guard let embArr = out.featureValue(for: "embedding")?.multiArrayValue else {
+            throw EngineError.outputMissing("embedding")
+        }
+        let embPtr = embArr.dataPointer.bindMemory(to: Float.self, capacity: 768)
+        var vec = [Float](repeating: 0, count: Self.outputDim)
+        for i in 0..<Self.outputDim { vec[i] = embPtr[i] }
+        var norm: Float = 0
+        vDSP_svesq(vec, 1, &norm, vDSP_Length(vec.count))
+        let inv = 1.0 / (norm.squareRoot() + 1e-12)
+        vDSP_vsmul(vec, 1, [inv], &vec, 1, vDSP_Length(vec.count))
+
+        AutoTest.log("[Engine] embedText \"\(query)\" tokens=\(ids.count) \(String(format: "%.0f", ms))ms")
+        return vec
+    }
+
+    private func loadTextAssets() async throws {
+        if tokenizer == nil {
+            guard let folder = Bundle.main.resourceURL?
+                .appendingPathComponent("Tokenizer", isDirectory: true) else {
+                throw EngineError.outputMissing("bundle 资源目录")
+            }
+            AutoTest.log("[Engine] 加载 tokenizer …")
+            tokenizer = try await AutoTokenizer.from(modelFolder: folder)
+        }
+        if vocabTable == nil {
+            guard let url = Bundle.main.url(forResource: "vocab_embeddings_i8",
+                                            withExtension: "bin", subdirectory: "Models") else {
+                throw EngineError.outputMissing("vocab_embeddings_i8.bin（Debug 注入，确认 ModelAssets 存在）")
+            }
+            AutoTest.log("[Engine] 加载词表 embedding 表 …")
+            vocabTable = try VocabEmbeddingTable(url: url)
+        }
     }
 }
