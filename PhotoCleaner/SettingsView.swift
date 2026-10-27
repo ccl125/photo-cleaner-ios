@@ -6,6 +6,7 @@ struct SettingsView: View {
     @AppStorage("fpThresholdV2") private var fpThresholdV2: Double = 0.15
     @AppStorage("junkThreshold") private var junkThreshold: Double = 0.6
     @AppStorage("autoIndexEnabled") private var autoIndexEnabled = true
+    @AppStorage("backgroundIndexEnabled") private var backgroundIndexEnabled = true
     @State private var modelVersion: String = "—"
 
     var body: some View {
@@ -14,6 +15,18 @@ struct SettingsView: View {
                 Toggle("自动索引", isOn: $autoIndexEnabled)
                     .tint(Theme.primary)
                 Text("启动后若有未索引照片，自动开始增量扫描；扫描完成自动刷新相似分组。")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                Toggle("后台自动索引（充电时）", isOn: $backgroundIndexEnabled)
+                    .tint(Theme.primary)
+                    .onChange(of: backgroundIndexEnabled) { _, on in
+                        if on {
+                            BackgroundIndexer.shared.scheduleNextIfEnabled()
+                        } else {
+                            BackgroundIndexer.shared.cancel()
+                        }
+                    }
+                Text("退到后台或锁屏后，系统会在充电时自动继续索引，无需打开 App。")
                     .font(.caption2)
                     .foregroundStyle(Theme.muted)
             } header: {

@@ -2,12 +2,21 @@ import SwiftUI
 
 @main
 struct PhotoCleanerApp: App {
-    @StateObject private var scanner = LibraryScanner()
+    @StateObject private var scanner: LibraryScanner
     @State private var path = NavigationPath()
 
     /// 自动化测试模式：启动后自动授权检查 → 小范围扫描 200 张 → 自动进分析页。
     /// 关键节点打 [AutoTest] 日志，供 xcodebuild test 日志采集。
     private let autoTest = ProcessInfo.processInfo.arguments.contains("-autoTest")
+
+    init() {
+        // BGTaskScheduler 注册必须在 applicationDidFinishLaunching 之前（App init 满足）
+        let scanner = LibraryScanner()
+        _scanner = StateObject(wrappedValue: scanner)
+        BackgroundIndexer.shared.configure(scanner: scanner)
+        BackgroundIndexer.shared.register()
+        BackgroundIndexer.shared.scheduleNextIfEnabled()
+    }
 
     var body: some Scene {
         WindowGroup {

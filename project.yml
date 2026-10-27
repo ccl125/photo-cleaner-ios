@@ -38,6 +38,10 @@ targets:
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         NSPhotoLibraryUsageDescription: 需要访问您的照片库，用于在设备本地检测相似与重复照片。全部分析仅在设备上完成，照片不会上传。
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.ccl125.PhotoCleaner.indexing
+        UIBackgroundModes:
+          - processing
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ccl125.PhotoCleaner

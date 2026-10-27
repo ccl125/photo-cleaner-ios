@@ -48,6 +48,10 @@ struct HomeView: View {
             if case .finished = newState, scanner.indexedCount >= 2, !AutoTest.enabled {
                 Task { await AnalysisService.shared.analyze(scanner: scanner) }
             }
+            // 扫描完成 → 排下一次后台索引任务
+            if case .finished = newState {
+                BackgroundIndexer.shared.scheduleNextIfEnabled()
+            }
         }
     }
 
