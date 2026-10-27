@@ -154,8 +154,11 @@ final class LibraryScanner: ObservableObject {
             do {
                 let id = asset.localIdentifier
                 let needsEmbed = !done.contains(id)
-                let needsOcr = !ocrDone.contains(id)
-                let needsQuality = !qualityDone.contains(id)
+                // 首遍索引优先速度：新照片只算向量（~130ms/张）；
+                // OCR/质量信号留给后续补建轮次（它们只在已有向量的条目上跑）。
+                // 否则每张 550ms+（OCR 占 70%），全量要拖数小时。
+                let needsOcr = !needsEmbed && !ocrDone.contains(id)
+                let needsQuality = !needsEmbed && !qualityDone.contains(id)
                 guard needsEmbed || needsOcr || needsQuality else { continue }
 
                 guard let image = await Self.requestImage(for: asset) else {
