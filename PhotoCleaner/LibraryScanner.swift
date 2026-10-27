@@ -33,6 +33,9 @@ final class LibraryScanner: ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var pauseRequested = false
     private var pendingTotal = 0
+
+    /// 本次扫描的待处理总数（进度条分母，只读暴露给 UI）。
+    var pendingTotalCount: Int { pendingTotal }
     private var ocrTotalMs: Double = 0
     private var ocrCount = 0
     private var qualityTotalMs: Double = 0

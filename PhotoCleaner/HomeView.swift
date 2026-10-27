@@ -185,7 +185,7 @@ struct HomeView: View {
             }
         case .running:
             ProgressView(value: scanner.progress) {
-                Text("扫描中 \(scanner.indexedCount + scanner.failedThisRun) / \(scanner.totalAssets)")
+                Text("扫描中 \(scanner.processedThisRun + scanner.failedThisRun) / \(scanner.pendingTotalCount)")
                     .font(.subheadline)
                     .foregroundStyle(Theme.ink)
             }
