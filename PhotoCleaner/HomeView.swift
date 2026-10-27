@@ -7,8 +7,10 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject private var scanner: LibraryScanner
     @AppStorage("junkThreshold") private var junkThreshold: Double = 0.6
+    @AppStorage("autoIndexEnabled") private var autoIndexEnabled = true
     @State private var cleanup: CleanupScanner.Summary?
     @State private var junkCount: Int?
+    @State private var didAutoStart = false
 
     var body: some View {
         ScrollView {
@@ -40,6 +42,32 @@ struct HomeView: View {
         .task(id: scanner.authStatus) { await loadCleanupSummary() }
         .task(id: junkThreshold) { await loadJunkCount() }
         .task(id: scanner.indexedCount) { await loadJunkCount() }
+        .task { await autoIndexIfNeeded() }
+        .onChange(of: scanner.state) { _, newState in
+            // 扫描完成 → 自动触发相似分组分析（缓存感知；自测模式走自己的流程）
+            if case .finished = newState, scanner.indexedCount >= 2, !AutoTest.enabled {
+                Task { await AnalysisService.shared.analyze(scanner: scanner) }
+            }
+        }
+    }
+
+    /// 自动索引：启动后延迟 2 秒（避开启动渲染），有未索引照片则自动增量扫描。
+    /// 每次冷启动最多自动触发一次；自测模式跳过（它有自己的扫描流程）。
+    private func autoIndexIfNeeded() async {
+        guard autoIndexEnabled, !AutoTest.enabled, !didAutoStart else { return }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        guard !Task.isCancelled, !didAutoStart else { return }
+        didAutoStart = true
+        scanner.refreshAuth()
+        scanner.refreshCounts()
+        guard hasAccess, scanner.state == .idle else { return }
+        let pending = scanner.totalAssets - scanner.indexedCount
+        guard pending > 0 else {
+            AutoTest.log("[Auto] 无未索引照片，跳过自动索引")
+            return
+        }
+        AutoTest.log("[Auto] 自动索引启动：待索引约 \(pending) 张")
+        scanner.start()
     }
 
     private var hasAccess: Bool {

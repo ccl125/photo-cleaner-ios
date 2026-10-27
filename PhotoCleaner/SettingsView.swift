@@ -5,10 +5,21 @@ struct SettingsView: View {
     @EnvironmentObject private var scanner: LibraryScanner
     @AppStorage("fpThresholdV2") private var fpThresholdV2: Double = 0.15
     @AppStorage("junkThreshold") private var junkThreshold: Double = 0.6
+    @AppStorage("autoIndexEnabled") private var autoIndexEnabled = true
     @State private var modelVersion: String = "—"
 
     var body: some View {
         List {
+            Section {
+                Toggle("自动索引", isOn: $autoIndexEnabled)
+                    .tint(Theme.primary)
+                Text("启动后若有未索引照片，自动开始增量扫描；扫描完成自动刷新相似分组。")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+            } header: {
+                Text("自动化").themeSectionHeader()
+            }
+
             Section {
                 LabeledSlider(
                     title: "重复判定严格度",

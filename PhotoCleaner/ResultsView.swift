@@ -3,11 +3,13 @@ import SwiftUI
 import UIKit
 
 /// 结果页：分段展示"重复照片"(>0.97) 与"相似照片"(0.90–0.97)。
-/// 每组自动质量打分并推荐保留项：
-///   - 重复组：默认保留推荐项、其余勾选删除（红色标记）
-///   - 相似组：只打"推荐"徽标，默认全部保留（橙色弱强调），由用户手动挑选
+/// 数据源为 AnalysisService（缓存优先 + 后台刷新）：
+///   - 缓存有效（索引数未变）→ 秒开上次结果，顶部提示后台刷新中，完成后热更新
+///   - 无缓存/索引数变了 → 全量分析（重复组打分 + 特征指纹验证 + 降级）
+///   - 用户已手动改过勾选时不被后台刷新打断；删除后缓存就地更新
 struct ResultsView: View {
     @EnvironmentObject private var scanner: LibraryScanner
+    @ObservedObject private var service = AnalysisService.shared
 
     struct GroupModel: Identifiable {
         let id = UUID()
@@ -23,9 +25,7 @@ struct ResultsView: View {
     }
 
     @State private var groups: [GroupModel] = []
-    @State private var analyzing = true
-    @State private var analyzeNote = "正在计算相似分组…"
-    @State private var groupProgress: Double = 0
+    @State private var userTouched = false   // 用户改过勾选后，后台刷新不打断当前选择
     @State private var deleting = false
     @State private var showConfirm = false
     @State private var errorMessage: String?
@@ -41,18 +41,22 @@ struct ResultsView: View {
 
     var body: some View {
         Group {
-            if analyzing {
+            if service.analyzing && !service.hasData {
                 VStack(spacing: Theme.Spacing.md) {
                     ProgressView()
                         .tint(Theme.primary)
-                    ProgressView(value: groupProgress)
+                    ProgressView(value: service.progress)
                         .tint(Theme.primary)
                         .frame(maxWidth: 280)
-                    Text(analyzeNote).foregroundStyle(Theme.muted)
+                    Text(service.note).foregroundStyle(Theme.muted)
                         .monospacedDigit()
                 }
             } else if groups.isEmpty {
-                ContentUnavailableView("没有发现相似照片", systemImage: "photo.on.rectangle.angled")
+                Theme.EmptyState(
+                    systemImage: "photo.on.rectangle.angled",
+                    title: "没有发现相似照片",
+                    hint: "换个时间段或继续扫描扩充索引后再看。"
+                )
             } else {
                 groupList
             }
@@ -92,13 +96,49 @@ struct ResultsView: View {
         } message: {
             Text(errorMessage ?? "")
         }
-        .task { await analyze() }
+        .task { await runAnalysis() }
+        .onChange(of: service.analysis) { _, newValue in
+            // 后台刷新完成 → 热更新；用户已改过勾选则保留当前选择
+            guard !userTouched, newValue != nil else { return }
+            rebuildModels()
+        }
+    }
+
+    // MARK: - 数据装配
+
+    private func runAnalysis() async {
+        // 自测模式行为不变：始终全量分析
+        await service.analyze(scanner: scanner, force: AutoTest.enabled)
+        rebuildModels()
+    }
+
+    private func rebuildModels() {
+        guard let analysis = service.analysis else { return }
+        groups = analysis.groups.map { g in
+            let assets = AnalysisService.fetchAssets(ids: g.assetIDs)
+            return GroupModel(
+                tier: g.tier == "duplicate" ? .duplicate : .similar,
+                assets: assets,
+                keepIDs: Set(g.keepIDs),
+                recommendedID: g.recommendedID,
+                sizes: g.sizes,
+                totalBytes: assets.reduce(0) { $0 + (g.sizes[$1.localIdentifier] ?? 0) }
+            )
+        }
     }
 
     // MARK: - 分段列表
 
     private var groupList: some View {
         List {
+            if service.refreshing, let at = service.analysis?.generatedAt {
+                Section {
+                    Label("上次分析于 \(at.formatted(date: .omitted, time: .shortened))，后台刷新中…",
+                          systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(Theme.muted)
+                }
+            }
             if !dupIndices.isEmpty {
                 Section {
                     ForEach(dupIndices, id: \.self) { i in
@@ -147,19 +187,20 @@ struct ResultsView: View {
             .frame(height: 118)
             Text(headerText(group.wrappedValue, ordinal: ordinal))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
             // 相似组惰性打分：不预拉图，用户点击后才对该组打分出推荐徽标
             if group.wrappedValue.tier == .similar && group.wrappedValue.recommendedID == nil {
                 if group.wrappedValue.isScoring {
                     HStack(spacing: 6) {
                         ProgressView().scaleEffect(0.7)
-                        Text("打分中…").font(.caption).foregroundStyle(.secondary)
+                        Text("打分中…").font(.caption).foregroundStyle(Theme.muted)
                     }
                 } else {
                     Button("为这组打分推荐") { scoreSimilarGroup(group) }
                         .font(.caption)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .tint(Theme.primary)
                 }
             }
         }
@@ -175,6 +216,7 @@ struct ResultsView: View {
     }
 
     private func toggle(_ asset: PHAsset, in group: Binding<GroupModel>) {
+        userTouched = true
         let id = asset.localIdentifier
         if group.wrappedValue.keepIDs.contains(id) {
             if group.wrappedValue.keepIDs.count > 1 { group.keepIDs.wrappedValue.remove(id) }
@@ -183,212 +225,13 @@ struct ResultsView: View {
         }
     }
 
-    // MARK: - 分析（分组 + 质量打分）
+    // MARK: - 相似组惰性打分
 
-    /// 重复组立即打分（成员 >20 时只对体积前 20 打分）；相似组惰性打分（进列表后再按需触发）。
-    /// 自测模式（-autoTest）跳过所有打分，findGroups 出结果即渲染，压缩回归时长。
-    private func analyze() async {
-        analyzing = true
-        UIApplication.shared.isIdleTimerDisabled = true
-        defer {
-            analyzing = false
-            UIApplication.shared.isIdleTimerDisabled = false
-        }
-
-        analyzeNote = "正在计算相似分组…"
-        groupProgress = 0
-        let store = scanner.store
-        let found = await Task.detached(priority: .userInitiated) { [store] in
-            DedupAnalyzer.findGroups(store: store) { p in
-                // 回调在后台线程触发，回主线程更新进度
-                Task { @MainActor in
-                    self.groupProgress = p
-                    self.analyzeNote = String(format: "正在计算相似分组… %.0f%%", p * 100)
-                }
-            }
-        }.value
-        AutoTest.log("[AutoTest] 分组完成: \(found.count) 组（重复 \(found.count(where: { $0.tier == .duplicate }))，相似 \(found.count(where: { $0.tier == .similar }))")
-
-        var models: [GroupModel] = []
-        var dupOrdinal = 0
-        let dupTotal = found.count(where: { $0.tier == .duplicate })
-        for g in found {
-            let assets = fetchAssets(ids: g.assetIDs)
-            guard !assets.isEmpty else { continue }
-
-            // 文件体积在后台线程批量取，避免主线程同步读 PhotoKit 元数据
-            let sizes = await Task.detached(priority: .userInitiated) {
-                var m: [String: Int64] = [:]
-                for a in assets { m[a.localIdentifier] = CleanupScanner.fileSize(of: a) }
-                return m
-            }.value
-            switch g.tier {
-            case .duplicate:
-                dupOrdinal += 1
-                if AutoTest.enabled {
-                    // 自测模式：跳过打分（打分链路由相似组的惰性按钮覆盖），默认保留第一张
-                    models.append(GroupModel(
-                        tier: .duplicate,
-                        assets: assets,
-                        keepIDs: [g.assetIDs.first ?? ""],
-                        recommendedID: nil,
-                        sizes: sizes,
-                        totalBytes: sizes.values.reduce(0, +)
-                    ))
-                    continue
-                }
-                analyzeNote = "正在为第 \(dupOrdinal)/\(dupTotal) 个重复组打分…"
-                groupProgress = Double(dupOrdinal) / Double(max(dupTotal, 1))
-                let (scores, recommended, images) = await scoreMembers(
-                    assets, sizes: sizes, label: "第 \(dupOrdinal)/\(dupTotal) 个重复组")
-                let anchor = recommended ?? g.assetIDs.first ?? ""
-
-                // 第二级像素级验证：特征指纹距离过大的成员（不同姿势/手势）降级到相似组
-                let distances = await Task.detached(priority: .userInitiated) {
-                    FeaturePrintVerifier.distancesToAnchor(anchorID: anchor, images: images)
-                }.value
-                var confirmed: [PHAsset] = []
-                var demoted: [PHAsset] = []
-                for a in assets {
-                    if a.localIdentifier == anchor { confirmed.append(a); continue }
-                    // 未参与打分/验证的成员（大组截断、拉图失败）：必须降级，
-                    // 绝不能带着删除建议留在重复组
-                    guard let d = distances[a.localIdentifier], d.isFinite else {
-                        demoted.append(a)
-                        AutoTest.log("[Analyze] 组 \(dupOrdinal) 成员 \(a.localIdentifier.prefix(8)) 降级: 未验证（大组截断或拉图失败）")
-                        continue
-                    }
-                    // 三重条件全部满足才算真重复：
-                    // 1. 指纹距离达标（像素级几乎一致）
-                    // 2. 像素宽高完全相同（不同构图/裁剪的尺寸必不同）
-                    // 3. 拍摄时间相差 10 分钟内（同一拍摄现场）
-                    let sameSize = a.pixelWidth == (assets.first { $0.localIdentifier == anchor }?.pixelWidth ?? -1)
-                        && a.pixelHeight == (assets.first { $0.localIdentifier == anchor }?.pixelHeight ?? -2)
-                    let anchorDate = assets.first { $0.localIdentifier == anchor }?.creationDate
-                    let closeTime: Bool
-                    if let ad = anchorDate, let cd = a.creationDate {
-                        closeTime = abs(cd.timeIntervalSince(ad)) <= 600
-                    } else {
-                        closeTime = true   // 无时间信息时不阻断
-                    }
-                    if d <= FeaturePrintVerifier.distanceThreshold && sameSize && closeTime {
-                        confirmed.append(a)
-                    } else {
-                        demoted.append(a)
-                        AutoTest.log("[Analyze] 组 \(dupOrdinal) 成员 \(a.localIdentifier.prefix(8)) 降级: 距离=\(String(format: "%.2f", d)) 同尺寸=\(sameSize) 时间近=\(closeTime)")
-                    }
-                }
-                if distances.isEmpty {
-                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 特征指纹计算失败（锚点无指纹），跳过二级验证")
-                }
-                // 全量距离落日志，供阈值校准
-                let allDist = distances
-                    .filter { $0.key != anchor }
-                    .map { "\($0.key.prefix(8))=\(String(format: "%.2f", $0.value))" }
-                    .joined(separator: ",")
-                if !allDist.isEmpty {
-                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 指纹距离: \(allDist)")
-                }
-                if !demoted.isEmpty {
-                    let distDesc = demoted.map {
-                        "\($0.localIdentifier.prefix(8))=\(String(format: "%.1f", distances[$0.localIdentifier] ?? -1))"
-                    }.joined(separator: ",")
-                    AutoTest.log("[Analyze] 组 \(dupOrdinal) 降级 \(demoted.count) 张到相似组: \(distDesc)")
-                }
-
-                // 重复组：默认保留推荐项，其余勾选删除；验证后不足 2 张则整组降为相似组
-                if confirmed.count < 2 {
-                    models.append(GroupModel(
-                        tier: .similar,
-                        assets: assets,
-                        keepIDs: Set(g.assetIDs),
-                        recommendedID: nil,
-                        sizes: sizes,
-                        totalBytes: assets.reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
-                    ))
-                } else {
-                    let keep: Set<String> = [anchor]
-                    models.append(GroupModel(
-                        tier: .duplicate,
-                        assets: confirmed,
-                        keepIDs: keep,
-                        recommendedID: recommended,
-                        scores: scores,
-                        sizes: sizes,
-                        totalBytes: confirmed.reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
-                    ))
-                    if !demoted.isEmpty, let first = confirmed.first {
-                        // 降级成员与锚点组成一个相似组，只浏览不建议删除
-                        models.append(GroupModel(
-                            tier: .similar,
-                            assets: [first] + demoted,
-                            keepIDs: Set(([first] + demoted).map(\.localIdentifier)),
-                            recommendedID: nil,
-                            sizes: sizes,
-                            totalBytes: ([first] + demoted).reduce(0) { $0 + (sizes[$1.localIdentifier] ?? 0) }
-                        ))
-                    }
-                }
-            case .similar:
-                // 相似组：保守，默认全保留；推荐徽标留空，由"为这组打分推荐"按钮惰性触发
-                models.append(GroupModel(
-                    tier: .similar,
-                    assets: assets,
-                    keepIDs: Set(g.assetIDs),
-                    recommendedID: nil,
-                    sizes: sizes,
-                    totalBytes: sizes.values.reduce(0, +)
-                ))
-            }
-        }
-        groups = models
-        let dupN = models.count(where: { $0.tier == .duplicate })
-        let simN = models.count - dupN
-        AutoTest.log("[AutoTest] 分析完成：重复组 \(dupN)，相似组 \(simN)")
-        scanner.autoTestStatus += "｜分析完成: 重复组=\(dupN), 相似组=\(simN)"
-    }
-
-    /// 对一组成员做质量打分：单组上限 20 个（按文件体积取大），256px + opportunistic + 8s 超时。
-    /// sizes 为分析阶段后台预取的体积表，排序只查内存，不在主线程重复读 PhotoKit 元数据。
-    /// 返回打分结果与已拉取的图片（供特征指纹二级验证复用，零额外拉图成本）。
-    private func scoreMembers(
-        _ assets: [PHAsset], sizes: [String: Int64], label: String
-    ) async -> (scores: [String: QualityScorer.MemberScore], recommended: String?, images: [String: UIImage]) {
-        let scored: [PHAsset]
-        if assets.count > 20 {
-            scored = Array(assets
-                .sorted { (sizes[$0.localIdentifier] ?? 0) > (sizes[$1.localIdentifier] ?? 0) }
-                .prefix(20))
-        } else {
-            scored = assets
-        }
-        AutoTest.log("[Analyze] \(label)，成员 \(assets.count) 个，实际打分 \(scored.count) 个")
-
-        var images: [String: UIImage] = [:]
-        for asset in scored {
-            if let img = await LibraryScanner.requestImage(
-                for: asset,
-                targetSize: CGSize(width: 256, height: 256),
-                deliveryMode: .opportunistic,
-                timeout: 8
-            ) {
-                images[asset.localIdentifier] = img
-            } else {
-                AutoTest.log("[Analyze] 成员图拉取失败（超时/iCloud）: \(asset.localIdentifier)")
-            }
-        }
-        let result = await Task.detached(priority: .userInitiated) {
-            QualityScorer.scoreGroup(assets: scored, images: images)
-        }.value
-        return (result.scores, result.recommended, images)
-    }
-
-    /// 相似组的惰性打分入口（按钮触发）：只对该组拉图打分，更新推荐徽标，不改勾选状态。
     private func scoreSimilarGroup(_ group: Binding<GroupModel>) {
         guard !group.wrappedValue.isScoring else { return }
         group.isScoring.wrappedValue = true
         Task {
-            let (scores, recommended, _) = await scoreMembers(
+            let (scores, recommended, _) = await service.scoreMembers(
                 group.wrappedValue.assets, sizes: group.wrappedValue.sizes, label: "相似组（手动）")
             group.scores.wrappedValue = scores
             group.recommendedID.wrappedValue = recommended
@@ -396,22 +239,19 @@ struct ResultsView: View {
         }
     }
 
-    private func fetchAssets(ids: [String]) -> [PHAsset] {
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-        var byID: [String: PHAsset] = [:]
-        result.enumerateObjects { asset, _, _ in byID[asset.localIdentifier] = asset }
-        return ids.compactMap { byID[$0] }
-    }
+    // MARK: - 删除
 
     private func deleteSelected() async {
         deleting = true
         defer { deleting = false }
         let ids = groups.flatMap(\.deleteIDs)
-        let assets = fetchAssets(ids: ids)
+        let assets = AnalysisService.fetchAssets(ids: ids)
         do {
             try await PhotoDeleter.delete(assets)
             scanner.store.delete(ids: ids)
-            await analyze()
+            userTouched = false
+            service.applyDeletions(ids, store: scanner.store)
+            rebuildModels()
         } catch {
             errorMessage = error.localizedDescription
         }
