@@ -114,9 +114,28 @@ final class BackgroundIndexer: @unchecked Sendable {
             }
 
             AutoTest.log("[BGTask] 开始增量扫描，约 \(pending) 条待处理")
+            // 若前台扫描被冻结（退后台时 isBusy 卡住），先暂停再重启，从断点续跑
+            if scanner.isBusy {
+                AutoTest.log("[BGTask] 检测到残留扫描状态，先暂停再重启")
+                scanner.pause()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
             scanner.start()
+            var lastProgress = -1
+            var lastProgressAt = Date()
             while scanner.isBusy && !state.isExpired {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let current = scanner.processedThisRun
+                if current != lastProgress {
+                    lastProgress = current
+                    lastProgressAt = Date()
+                } else if Date().timeIntervalSince(lastProgressAt) > 90 {
+                    AutoTest.log("[BGTask] 90 秒无进展，重启扫描（断点续跑）")
+                    scanner.pause()
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    scanner.start()
+                    lastProgressAt = Date()
+                }
             }
             guard !state.isExpired else {
                 state.finish(task, success: false)
