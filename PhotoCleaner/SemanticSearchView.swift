@@ -101,7 +101,7 @@ private struct SearchHitCell: View {
             thumb
                 .frame(maxWidth: .infinity)
                 .aspectRatio(1, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.gridCell))
                 .overlay(alignment: .bottomTrailing) {
                     Text(String(format: "%.3f", score))
                         .font(.caption2.monospacedDigit().bold())
@@ -113,12 +113,7 @@ private struct SearchHitCell: View {
                 }
                 .overlay(alignment: .topLeading) {
                     if keywordMatched {
-                        Text("文字")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(.blue, in: Capsule())
-                            .foregroundStyle(.white)
+                        Theme.Badge(text: "文字", systemImage: "text.viewfinder", color: Theme.primary)
                             .padding(4)
                     }
                 }

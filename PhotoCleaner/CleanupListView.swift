@@ -26,11 +26,14 @@ struct CleanupListView: View {
                         CleanupGridView(title: cat.title, assets: cat.assets)
                     } label: {
                         Label(cat.title, systemImage: cat.systemImage)
+                            .foregroundStyle(Theme.ink)
+                            .tint(Theme.primary)
                         Spacer()
                         Text("\(cat.assets.count) 项 · \(Self.formatBytes(cat.bytes))")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.muted)
                             .font(.subheadline)
                     }
+                    .frame(minHeight: 44)
                 }
             }
         }
@@ -99,11 +102,14 @@ struct CleanupGridView: View {
                     selected = selected.count == assets.count
                         ? [] : Set(assets.map(\.localIdentifier))
                 }
+                .tint(Theme.primary)
             }
             ToolbarItem(placement: .bottomBar) {
                 Button(role: .destructive) { showConfirm = true } label: {
-                    Text("删除选中 \(selected.count) 项（约 \(ResultsView.formatBytes(CleanupScanner.totalBytes(of: selectedAssets)))）")
+                    Label("删除选中 \(selected.count) 项（约 \(ResultsView.formatBytes(CleanupScanner.totalBytes(of: selectedAssets)))）",
+                          systemImage: "trash")
                 }
+                .tint(Theme.danger)
                 .disabled(selected.isEmpty)
             }
         }
@@ -148,11 +154,11 @@ private struct CleanupCell: View {
                 thumb
                     .frame(maxWidth: .infinity)
                     .aspectRatio(1, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.gridCell))
                     .opacity(isSelected ? 0.6 : 1)
                     .overlay(alignment: .topTrailing) {
                         Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(isSelected ? .green : .white)
+                            .foregroundStyle(isSelected ? Theme.success : .white)
                             .shadow(radius: 1)
                             .padding(6)
                     }

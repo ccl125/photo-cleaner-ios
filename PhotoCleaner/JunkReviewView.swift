@@ -32,8 +32,11 @@ struct JunkReviewView: View {
             if loading {
                 ProgressView("正在挑选废片候选…")
             } else if candidates.isEmpty {
-                ContentUnavailableView("没有废片候选", systemImage: "sparkles",
-                                       description: Text("当前阈值 \(String(format: "%.2f", threshold))，可在首页实验室调低"))
+                Theme.EmptyState(
+                    systemImage: "sparkles",
+                    title: "没有废片候选",
+                    hint: "当前阈值 \(String(format: "%.2f", threshold))。想审更多可在 设置 → 实验室 调低阈值。"
+                )
             } else if index >= candidates.count {
                 reviewDoneView
             } else {
@@ -83,15 +86,11 @@ struct JunkReviewView: View {
 
             HStack {
                 ForEach(c.reasons, id: \.self) { r in
-                    Text(r)
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(.orange.opacity(0.2), in: Capsule())
+                    Theme.Badge(text: r, systemImage: "exclamationmark.triangle", color: Theme.warning)
                 }
                 Text(String(format: "废片分 %.2f", c.score))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Theme.muted)
             }
 
             HStack(spacing: 40) {
@@ -101,7 +100,7 @@ struct JunkReviewView: View {
                         .frame(width: 120, height: 56)
                 }
                 .buttonStyle(.bordered)
-                .tint(.red)
+                .tint(Theme.danger)
                 .accessibilityIdentifier("junkDeleteButton")
 
                 Button { decide(.keep) } label: {
@@ -110,7 +109,7 @@ struct JunkReviewView: View {
                         .frame(width: 120, height: 56)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.green)
+                .tint(Theme.success)
                 .accessibilityIdentifier("junkKeepButton")
             }
             Spacer()
@@ -121,21 +120,24 @@ struct JunkReviewView: View {
     // MARK: - 审完结算
 
     private var reviewDoneView: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "checkmark.circle").font(.system(size: 56)).foregroundStyle(.green)
-            Text("审完了 \(candidates.count) 张").font(.title2.bold())
+        VStack(spacing: Theme.Spacing.lg) {
+            Image(systemName: "checkmark.circle").font(.system(size: 56)).foregroundStyle(Theme.success)
+            Text("审完了 \(candidates.count) 张").font(.title2.bold()).foregroundStyle(Theme.ink)
             Text("保留 \(keptCount) 张 · 待删 \(toDelete.count) 张")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
             if !toDelete.isEmpty {
                 Button(role: .destructive) { showConfirm = true } label: {
                     Text("删除 \(toDelete.count) 张")
                         .frame(minWidth: 160)
                 }
-                .buttonStyle(.borderedProminent)
+                .dangerButton()
+                .frame(maxWidth: 280)
                 .disabled(deleting)
                 .accessibilityIdentifier("junkCommitDeleteButton")
             }
-            Button("返回") { dismiss() }.buttonStyle(.bordered)
+            Button("返回") { dismiss() }
+                .secondaryButton()
+                .frame(maxWidth: 280)
         }
         .padding()
     }

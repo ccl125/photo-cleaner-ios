@@ -11,16 +11,30 @@ struct PhotoCleanerApp: App {
 
     var body: some Scene {
         WindowGroup {
-            NavigationStack(path: $path) {
-                HomeView()
-                    .navigationDestination(for: String.self) { dest in
-                        if dest == "results" {
-                            ResultsView()
-                        } else {
-                            EmptyView()
+            TabView {
+                NavigationStack(path: $path) {
+                    HomeView()
+                        .navigationDestination(for: String.self) { dest in
+                            if dest == "results" {
+                                ResultsView()
+                            } else {
+                                EmptyView()
+                            }
                         }
-                    }
+                }
+                .tabItem { Label("清理", systemImage: "sparkles.rectangle.stack") }
+
+                NavigationStack {
+                    SearchTabView()
+                }
+                .tabItem { Label("搜索", systemImage: "magnifyingglass") }
+
+                NavigationStack {
+                    SettingsView()
+                }
+                .tabItem { Label("设置", systemImage: "gearshape") }
             }
+            .tint(Theme.primary)
             .environmentObject(scanner)
             .task {
                 if autoTest { await runAutoTest() }

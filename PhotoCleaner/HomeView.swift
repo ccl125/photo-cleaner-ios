@@ -1,47 +1,38 @@
 import Photos
 import SwiftUI
 
-/// 首页：权限、扫描进度、统计、入口。
+/// 清理 Tab 首页：顶部真实相册/索引摘要 + 一句话状态，下面四个任务模块
+///（扫描 / 相似照片分组 / 废片速审 / 清理清单）。实验室滑块在设置 Tab。
+/// 状态覆盖：未授权 / 已授权未索引 / 扫描中 / 已完成 / 出错。
 struct HomeView: View {
     @EnvironmentObject private var scanner: LibraryScanner
-    @State private var cleanup: CleanupScanner.Summary?
-    @AppStorage("fpThresholdV2") private var fpThresholdV2: Double = 0.15
     @AppStorage("junkThreshold") private var junkThreshold: Double = 0.6
-    @State private var searchText = ""
+    @State private var cleanup: CleanupScanner.Summary?
     @State private var junkCount: Int?
 
     var body: some View {
-        VStack(spacing: 24) {
-            Text("PhotoCleaner")
-                .font(.largeTitle.bold())
+        ScrollView {
+            VStack(spacing: Theme.Spacing.lg) {
+                if !scanner.autoTestStatus.isEmpty {
+                    Text(scanner.autoTestStatus)
+                        .font(.caption)
+                        .foregroundStyle(Theme.muted)
+                        .accessibilityIdentifier("autoTestStatus")
+                }
 
-            if !scanner.autoTestStatus.isEmpty {
-                Text(scanner.autoTestStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("autoTestStatus")
+                summaryCard
+                scanModule
+
+                if scanner.authStatus == .authorized || scanner.authStatus == .limited {
+                    analyzeModule
+                    junkModule
+                    cleanupModule
+                }
             }
-
-            TextField("语义搜图：试试「猫」「风景」「文档」…", text: $searchText)
-                .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
-                .accessibilityIdentifier("searchField")
-
-            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                authSection
-                statsSection
-                cleanupSection
-                junkSection
-                scanSection
-                labSection
-
-                Spacer()
-            } else {
-                SearchResultsGrid(query: searchText)
-            }
+            .padding(Theme.Spacing.md)
         }
-        .padding()
-        .navigationBarHidden(true)
+        .background(Theme.background)
+        .navigationTitle("清理")
         .onAppear {
             scanner.refreshAuth()
             scanner.refreshCounts()
@@ -51,8 +42,12 @@ struct HomeView: View {
         .task(id: scanner.indexedCount) { await loadJunkCount() }
     }
 
+    private var hasAccess: Bool {
+        scanner.authStatus == .authorized || scanner.authStatus == .limited
+    }
+
     private func loadJunkCount() async {
-        guard scanner.authStatus == .authorized || scanner.authStatus == .limited else { return }
+        guard hasAccess else { return }
         let store = scanner.store
         let thr = junkThreshold
         junkCount = await Task.detached(priority: .utility) {
@@ -61,192 +56,249 @@ struct HomeView: View {
     }
 
     private func loadCleanupSummary() async {
-        guard scanner.authStatus == .authorized || scanner.authStatus == .limited else { return }
+        guard hasAccess else { return }
         cleanup = await Task.detached(priority: .utility) {
             CleanupScanner.summary()
         }.value
     }
 
-    // MARK: - 权限
+    // MARK: - 顶部摘要（真实数据 + 一句话状态）
+
+    private var summaryCard: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Text("相册索引")
+                .themeSectionHeader()
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(scanner.indexedCount) 张已索引")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                    Text("最近 6 个月共 \(scanner.totalAssets) 张")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.muted)
+                }
+                Spacer()
+                Image(systemName: summaryIcon)
+                    .font(.title2)
+                    .foregroundStyle(summaryIconColor)
+            }
+            Text(statusSentence)
+                .font(.subheadline)
+                .foregroundStyle(Theme.muted)
+        }
+        .themeCard()
+    }
+
+    private var summaryIcon: String {
+        switch scanner.state {
+        case .running, .preparingModels: return "arrow.triangle.2.circlepath"
+        case .finished: return "checkmark.shield"
+        case .failed: return "exclamationmark.triangle"
+        default: return hasAccess ? "photo.on.rectangle" : "lock.shield"
+        }
+    }
+
+    private var summaryIconColor: Color {
+        switch scanner.state {
+        case .finished: return Theme.success
+        case .failed: return Theme.danger
+        case .running, .preparingModels: return Theme.primary
+        default: return Theme.muted
+        }
+    }
+
+    private var statusSentence: String {
+        switch scanner.authStatus {
+        case .denied, .restricted:
+            return "没有照片访问权限，无法建立索引。"
+        case .notDetermined:
+            return "授权后即可开始。照片全程不出这台设备。"
+        default:
+            break
+        }
+        switch scanner.state {
+        case .preparingModels: return "正在加载本地模型（首次需编译，约 1 分钟）…"
+        case .running: return "正在索引照片：embedding + OCR + 质量信号。"
+        case .paused: return "扫描已暂停，进度已保存，随时继续。"
+        case .finished: return "索引就绪，可以分析分组、审废片或清理清单。"
+        case .failed: return "扫描出错，可重试，已索引的进度不会丢。"
+        case .idle:
+            return scanner.indexedCount > 0 ? "索引就绪，可以开始分析。" : "还没有索引。先扫描照片建立本地向量索引。"
+        }
+    }
+
+    // MARK: - 任务模块 1：扫描
 
     @ViewBuilder
-    private var authSection: some View {
+    private var scanModule: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Label("建立索引", systemImage: "arrow.triangle.2.circlepath")
+                .font(.headline)
+                .foregroundStyle(Theme.ink)
+            moduleBody
+        }
+        .themeCard()
+    }
+
+    @ViewBuilder
+    private var moduleBody: some View {
         switch scanner.authStatus {
-        case .authorized:
-            Label("已授权访问全部照片", systemImage: "checkmark.shield")
-                .foregroundStyle(.green)
-        case .limited:
-            Label("已授权访问部分照片（Limited 模式）", systemImage: "checkmark.shield")
-                .foregroundStyle(.orange)
         case .denied, .restricted:
-            VStack(spacing: 8) {
-                Label("未获得照片访问权限", systemImage: "exclamationmark.shield")
-                    .foregroundStyle(.red)
-                Button("去系统设置开启") {
-                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                        UIApplication.shared.open(url)
-                    }
+            Text("需要照片访问权限才能建立索引。")
+                .font(.subheadline)
+                .foregroundStyle(Theme.muted)
+            Button("去系统设置开启") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
                 }
             }
-        default:
+            .primaryButton()
+        case .notDetermined:
+            Text("扫描在本地为每张照片算向量、OCR 文字和质量信号，用于后续所有清理判定。")
+                .font(.subheadline)
+                .foregroundStyle(Theme.muted)
             Button("授权访问照片库") {
                 Task { await scanner.requestAccess() }
             }
-            .buttonStyle(.borderedProminent)
+            .primaryButton()
+        default:
+            scanControls
         }
     }
-
-    // MARK: - 统计
-
-    private var statsSection: some View {
-        VStack(spacing: 8) {
-            statRow("最近 6 个月图片", "\(scanner.totalAssets) 张")
-            statRow("已索引", "\(scanner.indexedCount) 张")
-            if scanner.avgMs > 0 {
-                statRow("单张耗时（上一张 / 平均）",
-                        String(format: "%.0f ms / %.0f ms", scanner.lastImageMs, scanner.avgMs))
-            }
-            if scanner.failedThisRun > 0 {
-                statRow("本次失败（iCloud 拉取失败等）", "\(scanner.failedThisRun) 张")
-            }
-        }
-        .padding()
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).monospacedDigit()
-        }
-        .font(.subheadline)
-    }
-
-    // MARK: - 清理清单
 
     @ViewBuilder
-    private var cleanupSection: some View {
-        if scanner.authStatus == .authorized || scanner.authStatus == .limited {
-            VStack(spacing: 8) {
-                if let cleanup {
-                    statRow("截图 / 录屏 / 大视频",
-                            "\(cleanup.screenshotCount) 张 / \(cleanup.recordingCount) 个 / \(CleanupListView.formatBytes(cleanup.largeVideoBytes))")
-                } else {
-                    statRow("截图 / 录屏 / 大视频", "统计中…")
-                }
-                NavigationLink("清理清单（截图 · 录屏 · 大视频）→") {
-                    CleanupListView()
-                }
-                .buttonStyle(.bordered)
-            }
-            .padding()
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        }
-    }
-
-    // MARK: - 废片清理
-
-    @ViewBuilder
-    private var junkSection: some View {
-        if scanner.authStatus == .authorized || scanner.authStatus == .limited {
-            NavigationLink {
-                JunkReviewView(threshold: junkThreshold)
-            } label: {
-                if let junkCount {
-                    Text("废片清理（\(junkCount) 张待审）→")
-                } else {
-                    Text("废片清理（统计中…）")
-                }
-            }
-            .buttonStyle(.bordered)
-            .accessibilityIdentifier("junkEntry")
-        }
-    }
-
-    // MARK: - 扫描控制
-
-    @ViewBuilder
-    private var scanSection: some View {
+    private var scanControls: some View {
         switch scanner.state {
         case .idle:
-            Button("开始扫描") { scanner.start() }
-                .buttonStyle(.borderedProminent)
-                .disabled(scanner.authStatus != .authorized && scanner.authStatus != .limited)
+            Button(scanner.indexedCount > 0 ? "继续扫描（增量）" : "开始扫描") { scanner.start() }
+                .primaryButton()
                 .accessibilityIdentifier("scanButton")
             Button("小范围测试（最近 200 张）") { scanner.startTest() }
-                .buttonStyle(.bordered)
-                .disabled(scanner.authStatus != .authorized && scanner.authStatus != .limited)
+                .secondaryButton()
                 .accessibilityIdentifier("testScanButton")
-            // 已有索引就随时可进分析页，不必先扫描
-            if scanner.indexedCount >= 2 { analyzeButton }
         case .preparingModels:
-            Label("正在加载模型（首次需编译，约 1 分钟）…", systemImage: "cpu")
-            ProgressView()
+            HStack(spacing: Theme.Spacing.sm) {
+                ProgressView()
+                Text("正在加载模型…")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.muted)
+            }
         case .running:
             ProgressView(value: scanner.progress) {
                 Text("扫描中 \(scanner.indexedCount + scanner.failedThisRun) / \(scanner.totalAssets)")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.ink)
+            }
+            if scanner.avgMs > 0 {
+                Text(String(format: "单张 %.0f ms · 本次失败 %d 张", scanner.avgMs, scanner.failedThisRun))
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
             }
             Button("暂停") { scanner.pause() }
-                .buttonStyle(.bordered)
+                .secondaryButton()
         case .paused:
             Text("已暂停（\(scanner.indexedCount)/\(scanner.totalAssets)）")
-            HStack {
-                Button("继续") { scanner.resume() }.buttonStyle(.borderedProminent)
-                if scanner.indexedCount >= 2 { analyzeButton }
-            }
+                .font(.subheadline)
+                .foregroundStyle(Theme.muted)
+            Button("继续") { scanner.resume() }
+                .primaryButton()
         case .finished:
-            Label("索引完成：\(scanner.indexedCount) 张", systemImage: "checkmark.circle")
-                .foregroundStyle(.green)
-            if scanner.indexedCount >= 2 { analyzeButton }
-            Button("重新扫描增量") { scanner.start() }
-                .buttonStyle(.bordered)
+            Label("索引完成：\(scanner.indexedCount) 张", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(Theme.success)
+                .font(.subheadline)
+            Button("扫描新增照片") { scanner.start() }
+                .secondaryButton()
         case .failed(let message):
             Label(message, systemImage: "xmark.octagon")
-                .foregroundStyle(.red)
+                .foregroundStyle(Theme.danger)
                 .font(.footnote)
             Button("重试") { scanner.start() }
-                .buttonStyle(.bordered)
+                .primaryButton()
         }
     }
 
-    // MARK: - 实验室（阈值调节）
+    // MARK: - 任务模块 2-4
 
-    private var labSection: some View {
-        VStack(spacing: 6) {
-            HStack {
-                Text("重复判定严格度").foregroundStyle(.secondary)
-                Spacer()
-                Text(String(format: "%.2f", fpThresholdV2)).monospacedDigit()
-            }
-            .font(.subheadline)
-            Slider(value: $fpThresholdV2, in: 0.05...0.60, step: 0.05)
-            Text("越小越严格：只有像素级几乎一样的照片才会进入删除建议")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            Divider().padding(.vertical, 4)
-
-            HStack {
-                Text("废片嫌疑阈值").foregroundStyle(.secondary)
-                Spacer()
-                Text(String(format: "%.2f", junkThreshold)).monospacedDigit()
-            }
-            .font(.subheadline)
-            Slider(value: $junkThreshold, in: 0.3...0.9, step: 0.05)
-            Text("越高越保守：只有废片特征很明显的照片才进入速审队列")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding()
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var analyzeButton: some View {
-        NavigationLink("分析相似照片 →") {
+    private var analyzeModule: some View {
+        NavigationLink {
             ResultsView()
+        } label: {
+            TaskModuleLabel(
+                icon: "square.grid.2x2", tint: Theme.primary,
+                title: "相似照片分组",
+                subtitle: scanner.indexedCount >= 2
+                    ? "重复组像素级复核 + 相似组聚类"
+                    : "需要先建立索引",
+                trailing: scanner.indexedCount >= 2 ? "\(scanner.indexedCount) 张可分析" : nil
+            )
         }
-        .buttonStyle(.borderedProminent)
+        .disabled(scanner.indexedCount < 2)
         .accessibilityIdentifier("analyzeLink")
+    }
+
+    private var junkModule: some View {
+        NavigationLink {
+            JunkReviewView(threshold: junkThreshold)
+        } label: {
+            TaskModuleLabel(
+                icon: "hand.thumbsdown", tint: Theme.danger,
+                title: "废片速审",
+                subtitle: "模糊 / 黑白帧 / 闭眼，左滑删右滑留",
+                trailing: junkCount.map { "\($0) 张待审" }
+            )
+        }
+        .accessibilityIdentifier("junkEntry")
+    }
+
+    private var cleanupModule: some View {
+        NavigationLink {
+            CleanupListView()
+        } label: {
+            TaskModuleLabel(
+                icon: "list.bullet.rectangle", tint: Theme.muted,
+                title: "清理清单",
+                subtitle: "截图 · 录屏 · 大视频",
+                trailing: cleanup.map {
+                    "\($0.screenshotCount)/\($0.recordingCount)/\(CleanupListView.formatBytes($0.largeVideoBytes))"
+                }
+            )
+        }
+    }
+}
+
+/// 任务模块标签：图标 + 标题 + 一句说明 + 右侧真实计数，统一卡片样式。
+private struct TaskModuleLabel: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let subtitle: String
+    var trailing: String?
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.md) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(tint)
+                .frame(width: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(Theme.ink)
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.muted)
+            }
+            Spacer()
+            if let trailing {
+                Text(trailing)
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(Theme.muted)
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(Theme.muted)
+        }
+        .frame(minHeight: 44)
+        .themeCard()
     }
 }

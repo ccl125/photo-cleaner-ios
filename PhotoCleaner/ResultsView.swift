@@ -42,11 +42,13 @@ struct ResultsView: View {
     var body: some View {
         Group {
             if analyzing {
-                VStack(spacing: 12) {
+                VStack(spacing: Theme.Spacing.md) {
                     ProgressView()
+                        .tint(Theme.primary)
                     ProgressView(value: groupProgress)
+                        .tint(Theme.primary)
                         .frame(maxWidth: 280)
-                    Text(analyzeNote).foregroundStyle(.secondary)
+                    Text(analyzeNote).foregroundStyle(Theme.muted)
                         .monospacedDigit()
                 }
             } else if groups.isEmpty {
@@ -71,8 +73,10 @@ struct ResultsView: View {
             if !groups.isEmpty {
                 ToolbarItem(placement: .bottomBar) {
                     Button(role: .destructive) { showConfirm = true } label: {
-                        Text("删除选中 \(selectedDeleteCount) 张（约 \(Self.formatBytes(selectedDeleteBytes))）")
+                        Label("删除选中 \(selectedDeleteCount) 张（约 \(Self.formatBytes(selectedDeleteBytes))）",
+                              systemImage: "trash")
                     }
+                    .tint(Theme.danger)
                     .disabled(selectedDeleteCount == 0 || deleting)
                 }
             }
@@ -102,6 +106,7 @@ struct ResultsView: View {
                     }
                 } header: {
                     Text("重复照片 · \(dupIndices.count) 组 · 建议删除 \(dupIndices.reduce(0) { $0 + groups[$1].deleteIDs.count }) 张")
+                        .foregroundStyle(Theme.danger)
                 }
             }
             if !simIndices.isEmpty {
@@ -111,8 +116,10 @@ struct ResultsView: View {
                     }
                 } header: {
                     Text("相似照片（同主题/连拍）· \(simIndices.count) 组")
+                        .foregroundStyle(Theme.warning)
                 } footer: {
                     Text("相似组默认不勾选删除；点“为这组打分推荐”可查看质量推荐，点击缩略图手动挑选。")
+                        .foregroundStyle(Theme.muted)
                 }
             }
         }
@@ -433,8 +440,8 @@ private struct AssetCell: View {
     @State private var image: UIImage?
 
     private var markColor: Color {
-        if isKept { return tier == .duplicate ? .green : .orange }
-        return tier == .duplicate ? .red : .gray
+        if isKept { return tier == .duplicate ? Theme.success : Theme.warning }
+        return tier == .duplicate ? Theme.danger : Theme.muted
     }
 
     var body: some View {
@@ -442,9 +449,9 @@ private struct AssetCell: View {
             ZStack(alignment: .bottomTrailing) {
                 thumb
                     .frame(width: 110, height: 110)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.gridCell))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8)
+                        RoundedRectangle(cornerRadius: Theme.Radius.gridCell)
                             .stroke(markColor, lineWidth: 3)
                     )
                     .opacity(isKept ? 1 : (tier == .duplicate ? 0.55 : 0.75))
@@ -454,12 +461,7 @@ private struct AssetCell: View {
             }
             .overlay(alignment: .topLeading) {
                 if isRecommended {
-                    Text("推荐")
-                        .font(.caption2.bold())
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.green, in: Capsule())
-                        .foregroundStyle(.white)
+                    Theme.Badge(text: "推荐", systemImage: "star.fill", color: Theme.success)
                         .padding(4)
                 }
             }
