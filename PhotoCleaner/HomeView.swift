@@ -113,6 +113,15 @@ struct HomeView: View {
             Text(statusSentence)
                 .font(.subheadline)
                 .foregroundStyle(Theme.muted)
+            if scanner.state == .running || scanner.state == .paused {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: scanner.progress)
+                        .tint(Theme.primary)
+                    Text("本次 \(scanner.processedThisRun + scanner.failedThisRun) / \(scanner.pendingTotalCount) 张")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(Theme.muted)
+                }
+            }
         }
         .themeCard()
     }

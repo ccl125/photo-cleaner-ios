@@ -125,7 +125,7 @@ final class LibraryScanner: ObservableObject {
                 || !qualityDone.contains($0.localIdentifier)
         }
         if let limit { pending = Array(pending.prefix(limit)) }
-        totalAssets = limit != nil ? pending.count : assets.count
+        totalAssets = assets.count   // 展示口径固定为相册真实总数；进度分母用 pendingTotal
         pendingTotal = pending.count
         indexedCount = done.count
         processedThisRun = 0
