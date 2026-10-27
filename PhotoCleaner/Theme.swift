@@ -6,20 +6,20 @@ enum Theme {
 
     // MARK: - 颜色（OKLCH → sRGB，浅 / 深两套）
 
-    /// 深莓红，品牌主行动。oklch(0.420 0.163 350)
-    static let primary = dynamic(light: "#881159", dark: "#C64E78")
-    /// 大色块背景。oklch(0.300 0.120 350)
-    static let primaryDeep = dynamic(light: "#550436", dark: "#7A1B44")
+    /// 墨蓝黑，品牌主行动。oklch(0.300 0.020 260)
+    static let primary = dynamic(light: "#282E38", dark: "#93A6C5")
+    /// 大色块背景。oklch(0.200 0.020 260)
+    static let primaryDeep = dynamic(light: "#11161F", dark: "#2A3140")
     /// 浅冰蓝，小标签/辅助状态。oklch(0.880 0.060 230)
     static let accent = dynamic(light: "#B0E0F8", dark: "#2C4A5C")
     /// 页面背景（浅=纯白，深=系统黑）
     static let background = dynamic(light: "#FFFFFF", dark: "#000000")
-    /// 工具面板/卡片底。oklch(0.965 0.008 350)
-    static let surface = dynamic(light: "#F8F1F4", dark: "#241B20")
-    /// 正文。oklch(0.220 0.025 350)，浅底对比度 ≥7:1
-    static let ink = dynamic(light: "#24161C", dark: "#F2E9ED")
-    /// 次要文字。oklch(0.460 0.025 350)
-    static let muted = dynamic(light: "#63535A", dark: "#A89AA1")
+    /// 工具面板/卡片底。oklch(0.965 0.005 260)
+    static let surface = dynamic(light: "#F1F3F7", dark: "#1A1E26")
+    /// 正文。oklch(0.240 0.015 260)，浅底对比度 ≥7:1
+    static let ink = dynamic(light: "#1B1F27", dark: "#E6E8EB")
+    /// 次要文字。oklch(0.470 0.015 260)
+    static let muted = dynamic(light: "#565B63", dark: "#9499A0")
     static let success = dynamic(light: "#007E46", dark: "#3DAF7A")
     static let danger = dynamic(light: "#BE222A", dark: "#E5585F")
     /// 警示橙（相似组/废片原因等非危险提示）
@@ -68,7 +68,7 @@ enum Theme {
 
     // MARK: - 按钮修饰（触控目标 ≥44pt）
 
-    /// 主按钮：深莓红底白字。
+    /// 主按钮：墨蓝黑底白字。
     struct PrimaryButton: ViewModifier {
         func body(content: Content) -> some View {
             content
