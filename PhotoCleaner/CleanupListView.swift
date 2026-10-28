@@ -73,6 +73,7 @@ struct CleanupGridView: View {
     @State private var showConfirm = false
     @State private var errorMessage: String?
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var scanner: LibraryScanner
 
     private let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
 
@@ -131,10 +132,15 @@ struct CleanupGridView: View {
         do {
             try await PhotoDeleter.delete(victims)
             let deleted = Set(victims.map(\.localIdentifier))
+            // 清索引（截图也可能有向量）+ 同步分析缓存
+            scanner.store.deleteEverywhere(ids: Array(deleted))
+            AnalysisService.shared.applyDeletions(Array(deleted), store: scanner.store)
             assets.removeAll { deleted.contains($0.localIdentifier) }
             selected = []
             if assets.isEmpty { dismiss() }
         } catch {
+            // 用户在系统确认框点"取消"是正常路径，静默保留勾选
+            if PhotoDeleter.isCancellation(error) { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -175,14 +181,16 @@ private struct CleanupCell: View {
         }
         .buttonStyle(.plain)
         .task(id: asset.localIdentifier) {
-            image = await Self.loadThumbnail(asset: asset)
+            guard image == nil else { return }
+            image = await ThumbnailCache.image(for: asset, size: Self.thumbSize)
         }
     }
 
     private var thumb: some View {
-        Group {
-            if let image {
-                Image(uiImage: image).resizable().scaledToFill()
+        let img = image ?? ThumbnailCache.cached(for: asset, size: Self.thumbSize)
+        return Group {
+            if let img {
+                Image(uiImage: img).resizable().scaledToFill()
             } else {
                 Color.gray.opacity(0.15)
             }
@@ -190,23 +198,5 @@ private struct CleanupCell: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    static func loadThumbnail(asset: PHAsset) async -> UIImage? {
-        await withCheckedContinuation { cont in
-            let opts = PHImageRequestOptions()
-            opts.deliveryMode = .opportunistic
-            opts.resizeMode = .fast
-            opts.isNetworkAccessAllowed = true
-            var resumed = false
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: 240, height: 240),
-                contentMode: .aspectFill,
-                options: opts
-            ) { image, _ in
-                guard !resumed else { return }
-                resumed = true
-                cont.resume(returning: image)
-            }
-        }
-    }
+    private static let thumbSize = CGSize(width: 240, height: 240)
 }

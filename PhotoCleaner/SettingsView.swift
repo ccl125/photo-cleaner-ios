@@ -53,6 +53,17 @@ struct SettingsView: View {
                 infoRow("向量维度", "\(EmbeddingEngine.outputDim) 维（MRL 截断）")
                 infoRow("索引版本", modelVersion)
                 infoRow("已索引", "\(scanner.indexedCount) 张")
+                if versionMismatch {
+                    Label("索引版本过旧（库 \(modelVersion) ≠ 当前 \(EmbeddingStore.modelVersion)），建议重建",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.warning)
+                    Button(role: .destructive) { rebuildIndex() } label: {
+                        Label("清空索引并重建", systemImage: "arrow.clockwise")
+                    }
+                    .tint(Theme.danger)
+                    .accessibilityIdentifier("rebuildIndexButton")
+                }
             } header: {
                 Text("模型与索引").themeSectionHeader()
             }
@@ -98,6 +109,19 @@ struct SettingsView: View {
             Text(value).foregroundStyle(Theme.ink).monospacedDigit()
         }
         .font(.subheadline)
+    }
+
+    private var versionMismatch: Bool {
+        modelVersion != "—" && modelVersion != "未建立" && modelVersion != EmbeddingStore.modelVersion
+    }
+
+    /// 一键重建：清三张数据表 + 删分析缓存 + 刷新计数（自动索引会接着重扫）。
+    private func rebuildIndex() {
+        scanner.store.resetAll()
+        AnalysisService.shared.clearCache()
+        scanner.refreshCounts()
+        modelVersion = scanner.store.metaValue("modelVersion") ?? "未建立"
+        AutoTest.log("[Settings] 用户触发索引重建")
     }
 }
 

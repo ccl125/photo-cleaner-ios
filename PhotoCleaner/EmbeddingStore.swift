@@ -3,9 +3,10 @@ import SQLite3
 
 /// Zero-dependency embedding persistence backed by the SQLite3 C API.
 ///
-/// Table `embeddings`: localIdentifier -> 256-d Float32 vector blob.
-/// All methods are called from the main actor (the scan loop), so no extra
-/// synchronisation is needed; SQLite itself is opened in serialized mode.
+/// Tables: `embeddings`（id → 256d Float32 blob）、`ocr`（id → 文本）、
+/// `quality`（id → 质量信号）、`meta`（modelVersion）。
+/// 多线程访问来源：扫描主循环（MainActor）+ 搜索/分析的后台读取；
+/// open() 加锁防重复打开泄漏句柄，其余操作依赖调用方串行 + SQLite 串行模式。
 final class EmbeddingStore {
 
     enum StoreError: LocalizedError {
@@ -22,6 +23,8 @@ final class EmbeddingStore {
 
     private var db: OpaquePointer?
     private let dim: Int
+    /// open() 的 check-then-set 竞态保护（搜索/分析后台线程与扫描主线程可能同时触发）
+    private let openLock = NSLock()
 
     /// 索引格式版本：模型/维度/量化方式变化时递增；不匹配只记录日志，不强制清库。
     static let modelVersion = "eg2-256d-v1"
@@ -35,6 +38,8 @@ final class EmbeddingStore {
     // MARK: - Open / schema
 
     func open() throws {
+        openLock.lock()
+        defer { openLock.unlock() }
         guard db == nil else { return }
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let url = docs.appendingPathComponent("embeddings.sqlite")
@@ -105,11 +110,15 @@ final class EmbeddingStore {
 
     // MARK: - Writes
 
-    func insert(id: String, vector: [Float]) {
-        guard let db else { return }
+    @discardableResult
+    func insert(id: String, vector: [Float]) -> Bool {
+        guard let db else { return false }
         let sql = "INSERT OR REPLACE INTO embeddings(id, dim, vec, created_at) VALUES(?, ?, ?, ?)"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            AutoTest.log("[Store] 写入准备失败(embeddings): \(lastMessage())")
+            return false
+        }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_bind_int(stmt, 2, Int32(vector.count))
@@ -117,7 +126,9 @@ final class EmbeddingStore {
             sqlite3_bind_blob(stmt, 3, buf.baseAddress, Int32(vector.count * MemoryLayout<Float>.size), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
         sqlite3_bind_double(stmt, 4, Date().timeIntervalSince1970)
-        sqlite3_step(stmt)
+        let ok = sqlite3_step(stmt) == SQLITE_DONE
+        if !ok { AutoTest.log("[Store] 向量写入失败 \(id): \(lastMessage())") }
+        return ok
     }
 
     func delete(ids: [String]) {
@@ -182,16 +193,19 @@ final class EmbeddingStore {
 
     // MARK: - OCR 索引
 
-    func insertOcr(id: String, text: String) {
-        guard let db else { return }
+    @discardableResult
+    func insertOcr(id: String, text: String) -> Bool {
+        guard let db else { return false }
         let sql = "INSERT OR REPLACE INTO ocr(id, text, done_at) VALUES(?, ?, ?)"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_bind_text(stmt, 2, text, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
-        sqlite3_step(stmt)
+        let ok = sqlite3_step(stmt) == SQLITE_DONE
+        if !ok { AutoTest.log("[Store] OCR 写入失败 \(id): \(lastMessage())") }
+        return ok
     }
 
     /// 已有 OCR 记录（含空文本——跑过即算完成，支持断点续跑/补建判断）。
@@ -266,14 +280,15 @@ final class EmbeddingStore {
         var hasFace: Bool
     }
 
-    func insertQuality(id: String, record r: QualityRecord) {
-        guard let db else { return }
+    @discardableResult
+    func insertQuality(id: String, record r: QualityRecord) -> Bool {
+        guard let db else { return false }
         let sql = """
             INSERT OR REPLACE INTO quality(id, blur, bright_mean, bright_std, face_quality, has_face, done_at)
             VALUES(?, ?, ?, ?, ?, ?, ?)
             """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_bind_double(stmt, 2, r.blur)
@@ -282,7 +297,9 @@ final class EmbeddingStore {
         sqlite3_bind_double(stmt, 5, r.faceQuality)
         sqlite3_bind_int(stmt, 6, r.hasFace ? 1 : 0)
         sqlite3_bind_double(stmt, 7, Date().timeIntervalSince1970)
-        sqlite3_step(stmt)
+        let ok = sqlite3_step(stmt) == SQLITE_DONE
+        if !ok { AutoTest.log("[Store] 质量信号写入失败 \(id): \(lastMessage())") }
+        return ok
     }
 
     /// 已跑过质量信号的 id 集合（断点续跑/补建判断）。
@@ -334,5 +351,25 @@ final class EmbeddingStore {
             sqlite3_exec(db, "COMMIT", nil, nil, nil)
             sqlite3_finalize(stmt)
         }
+    }
+
+    /// 内容签名：embeddings 表里最大的 created_at（缓存失效键的一部分）。
+    func maxCreatedAt() -> Double {
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT MAX(created_at) FROM embeddings", -1, &stmt, nil) == SQLITE_OK,
+              sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return sqlite3_column_double(stmt, 0)
+    }
+
+    /// 清空三张数据表 + 版本标记对齐当前（设置页"重建索引"入口用）。
+    func resetAll() {
+        guard let db else { return }
+        for table in ["embeddings", "ocr", "quality"] {
+            sqlite3_exec(db, "DELETE FROM \(table)", nil, nil, nil)
+        }
+        setMeta("modelVersion", Self.modelVersion)
+        AutoTest.log("[Store] 索引已清空（embeddings/ocr/quality），版本标记为 \(Self.modelVersion)")
     }
 }

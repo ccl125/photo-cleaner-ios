@@ -118,7 +118,18 @@ final class BackgroundIndexer: @unchecked Sendable {
             if scanner.isBusy {
                 AutoTest.log("[BGTask] 检测到残留扫描状态，先暂停再重启")
                 scanner.pause()
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                // pause 只置标志位，扫描循环下一次迭代才把状态落成 .paused；
+                // 直接 start 会被 guard !isBusy 挡掉，必须等它真正退出
+                var waited = 0
+                while scanner.isBusy && waited < 10 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    waited += 1
+                }
+                guard !scanner.isBusy else {
+                    AutoTest.log("[BGTask] 残留扫描 5s 内未退出，放弃本次后台任务")
+                    state.finish(task, success: false)
+                    return
+                }
             }
             scanner.start()
             var lastProgress = -1

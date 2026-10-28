@@ -208,9 +208,12 @@ struct JunkReviewView: View {
         do {
             try await PhotoDeleter.delete(victims)
             scanner.store.deleteEverywhere(ids: ids)
+            AnalysisService.shared.applyDeletions(ids, store: scanner.store)
             AutoTest.log("[Junk] 已删除 \(ids.count) 张废片")
             dismiss()
         } catch {
+            // 用户在系统确认框点"取消"是正常路径，静默返回（待删列表保留）
+            if PhotoDeleter.isCancellation(error) { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -224,8 +227,8 @@ private struct JunkCard: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 16).fill(.gray.opacity(0.1))
-            if let image {
-                Image(uiImage: image)
+            if let displayImage {
+                Image(uiImage: displayImage)
                     .resizable()
                     .scaledToFit()
                     .clipShape(RoundedRectangle(cornerRadius: 16))
@@ -236,27 +239,17 @@ private struct JunkCard: View {
         .frame(maxWidth: .infinity)
         .frame(height: 420)
         .task(id: candidate.id) {
-            image = await Self.load(asset: candidate.asset)
+            guard image == nil else { return }
+            image = await ThumbnailCache.image(for: candidate.asset, size: Self.cardSize,
+                                               contentMode: .aspectFit)
         }
     }
 
-    static func load(asset: PHAsset) async -> UIImage? {
-        await withCheckedContinuation { cont in
-            let opts = PHImageRequestOptions()
-            opts.deliveryMode = .opportunistic
-            opts.resizeMode = .fast
-            opts.isNetworkAccessAllowed = true
-            var resumed = false
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: 1200, height: 1200),
-                contentMode: .aspectFit,
-                options: opts
-            ) { image, _ in
-                guard !resumed else { return }
-                resumed = true
-                cont.resume(returning: image)
-            }
-        }
+    /// 缓存同步命中直接显示
+    private var displayImage: UIImage? {
+        image ?? ThumbnailCache.cached(for: candidate.asset, size: Self.cardSize,
+                                       contentMode: .aspectFit)
     }
+
+    private static let cardSize = CGSize(width: 1200, height: 1200)
 }

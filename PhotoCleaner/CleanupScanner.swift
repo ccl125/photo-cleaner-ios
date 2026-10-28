@@ -28,11 +28,14 @@ enum CleanupScanner {
         let opts = PHFetchOptions()
         opts.predicate = NSPredicate(format: "mediaType == %ld", PHAssetMediaType.video.rawValue)
         let result = PHAsset.fetchAssets(with: opts)
-        var assets: [PHAsset] = []
-        assets.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in assets.append(asset) }
-        assets.sort { fileSize(of: $0) > fileSize(of: $1) }
-        return Array(assets.prefix(limit))
+        // 先取一次 fileSize 再排序，避免比较器里重复读 PHAssetResource
+        var sized: [(asset: PHAsset, size: Int64)] = []
+        sized.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in
+            sized.append((asset, fileSize(of: asset)))
+        }
+        sized.sort { $0.size > $1.size }
+        return sized.prefix(limit).map(\.asset)
     }
 
     // MARK: - 汇总
@@ -83,5 +86,13 @@ enum PhotoDeleter {
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assets as NSArray)
         }
+        // 删除成功后清掉缩略图缓存，避免已删照片残留
+        ThumbnailCache.evict(ids: assets.map(\.localIdentifier))
+    }
+
+    /// 用户在系统删除确认框点了"取消"（PHPhotosErrorDomain 3072）——正常路径，不该报错。
+    static func isCancellation(_ error: Error) -> Bool {
+        let e = error as NSError
+        return e.domain == PHPhotosErrorDomain && e.code == PHPhotosError.Code.userCancelled.rawValue
     }
 }

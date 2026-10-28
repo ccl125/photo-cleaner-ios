@@ -41,16 +41,16 @@ struct HomeView: View {
         }
         .task(id: scanner.authStatus) { await loadCleanupSummary() }
         .task(id: junkThreshold) { await loadJunkCount() }
-        .task(id: scanner.indexedCount) { await loadJunkCount() }
         .task { await autoIndexIfNeeded() }
         .onChange(of: scanner.state) { _, newState in
             // 扫描完成 → 自动触发相似分组分析（缓存感知；自测模式走自己的流程）
             if case .finished = newState, scanner.indexedCount >= 2, !AutoTest.enabled {
                 Task { await AnalysisService.shared.analyze(scanner: scanner) }
             }
-            // 扫描完成 → 排下一次后台索引任务
             if case .finished = newState {
                 BackgroundIndexer.shared.scheduleNextIfEnabled()
+                // 扫描期间不逐张重算废片候选，完成后一次性刷新
+                Task { await loadJunkCount() }
             }
         }
     }

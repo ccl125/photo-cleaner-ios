@@ -4,11 +4,13 @@ import SwiftUI
 import UIKit
 
 /// 分析结果的磁盘缓存（Documents/analysis_cache.json）。
-/// 失效策略：indexedCount 与当前向量库条数不一致即失效；删除后经 applyDeletions 同步更新。
+/// 失效策略：内容签名（向量条数 + 最新向量的 created_at）与当前库不一致即失效——
+/// 单看条数会被"删 3 张拍 3 张"骗过。删除后经 applyDeletions 同步更新。
 struct CachedAnalysis: Codable, Equatable {
-    var version: Int = 1
+    var version: Int = 2
     var generatedAt: Date
     var indexedCount: Int
+    var contentStamp: Double   // embeddings 表 MAX(created_at)
     var groups: [CachedGroup]
 }
 
@@ -55,7 +57,7 @@ final class AnalysisService: ObservableObject {
         try? data.write(to: Self.cacheURL, options: .atomic)
     }
 
-    /// 删除完成后同步缓存：移除已删成员、丢弃空组/单张组，indexedCount 对齐当前库。
+    /// 删除完成后同步缓存：移除已删成员、丢弃空组/单张组，内容签名对齐当前库。
     func applyDeletions(_ deletedIDs: [String], store: EmbeddingStore) {
         guard var a = analysis else { return }
         let deleted = Set(deletedIDs)
@@ -68,10 +70,20 @@ final class AnalysisService: ObservableObject {
             return g.assetIDs.count >= 2 ? g : nil
         }
         a.indexedCount = store.count()
+        a.contentStamp = store.maxCreatedAt()
         a.generatedAt = Date()
         analysis = a
         saveCache()
         AutoTest.log("[Analysis] 缓存已更新：删除 \(deleted.count) 张，剩 \(a.groups.count) 组")
+    }
+
+    /// 清空磁盘缓存（设置页"重建索引"用）。
+    func clearCache() {
+        try? FileManager.default.removeItem(at: Self.cacheURL)
+        analysis = nil
+        hasData = false
+        fromCache = false
+        AutoTest.log("[Analysis] 分析缓存已删除")
     }
 
     // MARK: - 分析入口
@@ -84,7 +96,8 @@ final class AnalysisService: ObservableObject {
         let store = scanner.store
         try? store.open()
 
-        if !force, let cached = Self.loadCacheFile(), cached.indexedCount == store.count() {
+        if !force, let cached = Self.loadCacheFile(),
+           cached.indexedCount == store.count(), cached.contentStamp == store.maxCreatedAt() {
             analysis = cached
             hasData = true
             fromCache = true
@@ -219,7 +232,8 @@ final class AnalysisService: ObservableObject {
             }
         }
 
-        let result = CachedAnalysis(generatedAt: Date(), indexedCount: store.count(), groups: out)
+        let result = CachedAnalysis(generatedAt: Date(), indexedCount: store.count(),
+                                    contentStamp: store.maxCreatedAt(), groups: out)
         analysis = result
         hasData = true
         fromCache = false

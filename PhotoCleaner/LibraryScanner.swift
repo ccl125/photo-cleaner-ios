@@ -168,8 +168,13 @@ final class LibraryScanner: ObservableObject {
                 }
                 if needsEmbed {
                     let (vector, _) = try await engine.embed(image)
-                    store.insert(id: id, vector: vector)
-                    indexedCount += 1
+                    if store.insert(id: id, vector: vector) {
+                        indexedCount += 1
+                    } else {
+                        // 写库失败（磁盘满等）：计失败，不算已索引（下次扫描会重试）
+                        failedThisRun += 1
+                        continue
+                    }
                 }
                 if needsOcr {
                     let t0 = CFAbsoluteTimeGetCurrent()
@@ -177,7 +182,7 @@ final class LibraryScanner: ObservableObject {
                         OcrEngine.recognizeText(image)
                     }.value
                     let ocrMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-                    store.insertOcr(id: id, text: text)
+                    if !store.insertOcr(id: id, text: text) { failedThisRun += 1 }
                     ocrTotalMs += ocrMs
                     ocrCount += 1
                     AutoTest.log("[Scanner] ocr \(String(format: "%.0f", ocrMs))ms（\(text.isEmpty ? "无文字" : "\(text.count) 字符")）")
@@ -188,7 +193,7 @@ final class LibraryScanner: ObservableObject {
                         JunkScorer.computeSignals(image)
                     }.value
                     let qMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-                    store.insertQuality(id: id, record: record)
+                    if !store.insertQuality(id: id, record: record) { failedThisRun += 1 }
                     qualityTotalMs += qMs
                     qualityCount += 1
                     let (js, reasons) = JunkScorer.score(record)

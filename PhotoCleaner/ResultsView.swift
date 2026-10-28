@@ -34,8 +34,9 @@ struct ResultsView: View {
     private var simIndices: [Int] { groups.indices.filter { groups[$0].tier == .similar } }
     private var selectedDeleteCount: Int { groups.reduce(0) { $0 + $1.deleteIDs.count } }
     private var selectedDeleteBytes: Int64 {
+        // 直接读分析阶段已缓存的 sizes，不在主线程重复查 PHAssetResource
         groups.reduce(0) { sum, g in
-            sum + Self.fileSize(of: g.assets.filter { !g.keepIDs.contains($0.localIdentifier) })
+            sum + g.deleteIDs.reduce(0) { $0 + (g.sizes[$1] ?? 0) }
         }
     }
 
@@ -248,11 +249,13 @@ struct ResultsView: View {
         let assets = AnalysisService.fetchAssets(ids: ids)
         do {
             try await PhotoDeleter.delete(assets)
-            scanner.store.delete(ids: ids)
+            scanner.store.deleteEverywhere(ids: ids)  // embeddings/ocr/quality 三清，不留孤儿行
             userTouched = false
             service.applyDeletions(ids, store: scanner.store)
             rebuildModels()
         } catch {
+            // 用户在系统确认框点"取消"是正常路径，静默保留勾选
+            if PhotoDeleter.isCancellation(error) { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -320,39 +323,22 @@ private struct AssetCell: View {
         .buttonStyle(.plain)
         .task(id: asset.localIdentifier) {
             // 自测模式下跳过缩略图加载，保持无障碍树轻量（XCT 快照 60s 超时）
-            guard !AutoTest.enabled else { return }
-            image = await Self.loadThumbnail(asset: asset)
+            guard !AutoTest.enabled, image == nil else { return }
+            image = await ThumbnailCache.image(for: asset, size: Self.thumbSize)
         }
     }
 
     private var thumb: some View {
-        Group {
-            if let image {
-                Image(uiImage: image).resizable().scaledToFill()
+        // 缓存同步命中直接显示（避免滚动闪灰），未命中才异步拉图
+        let img = image ?? ThumbnailCache.cached(for: asset, size: Self.thumbSize)
+        return Group {
+            if let img {
+                Image(uiImage: img).resizable().scaledToFill()
             } else {
                 Color.gray.opacity(0.15)
             }
         }
     }
 
-    static func loadThumbnail(asset: PHAsset) async -> UIImage? {
-        await withCheckedContinuation { cont in
-            let opts = PHImageRequestOptions()
-            opts.deliveryMode = .opportunistic
-            opts.resizeMode = .fast
-            opts.isNetworkAccessAllowed = true
-            var resumed = false
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: 220, height: 220),
-                contentMode: .aspectFill,
-                options: opts
-            ) { image, _ in
-                // opportunistic 可能回调两次（先低清后高清），只取第一次
-                guard !resumed else { return }
-                resumed = true
-                cont.resume(returning: image)
-            }
-        }
-    }
+    private static let thumbSize = CGSize(width: 220, height: 220)
 }

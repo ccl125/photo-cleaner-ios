@@ -38,7 +38,13 @@ enum SemanticSearch {
         private(set) var count = 0
         private var ocrCount = 0
 
+        /// reload 与 topK 都持锁：快速输入时并发搜索任务会撞 reload 重分配 matrix，
+        /// 不持锁则 sgemv 可能在读已释放的旧 buffer（use-after-free）。
+        private let lock = NSLock()
+
         func reloadIfNeeded(store: EmbeddingStore) {
+            lock.lock()
+            defer { lock.unlock() }
             let n = store.count()
             let ocrN = store.ocrCoverage().total
             guard n != count || ocrN != ocrCount else { return }
@@ -46,7 +52,11 @@ enum SemanticSearch {
             ids = all.map(\.id)
             matrix = all.flatMap(\.vector)
             count = n
-            ocrTexts = store.fetchAllOcr().mapValues { $0.lowercased() }
+            // OCR 文本只保留有向量的 id（删除后 ocr 表可能有残留；正常路径已三清，这里是兜底）
+            let validIDs = Set(all.map(\.id))
+            ocrTexts = store.fetchAllOcr()
+                .filter { validIDs.contains($0.key) }
+                .mapValues { $0.lowercased() }
             ocrCount = ocrN
             AutoTest.log("[Search] 向量索引重建: \(n) 条向量，\(ocrN) 条 OCR")
         }
@@ -58,6 +68,8 @@ enum SemanticSearch {
 
         /// 混合检索：cosine 语义分 + OCR 关键词命中加分，按合并分降序。
         func hybridTopK(queryVector: [Float], queryText: String, k: Int) -> [Hit] {
+            lock.lock()
+            defer { lock.unlock() }
             guard count > 0, queryVector.count == EmbeddingEngine.outputDim else { return [] }
             var scores = [Float](repeating: 0, count: count)
             matrix.withUnsafeBufferPointer { m in
